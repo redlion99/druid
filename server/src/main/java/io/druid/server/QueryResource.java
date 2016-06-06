@@ -22,10 +22,13 @@ package io.druid.server;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.jaxrs.smile.SmileMediaTypes;
+import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.MapMaker;
+import com.google.common.io.CountingOutputStream;
 import com.google.inject.Inject;
+import com.metamx.common.ISE;
 import com.metamx.common.guava.Sequence;
 import com.metamx.common.guava.Sequences;
 import com.metamx.common.guava.Yielder;
@@ -41,6 +44,12 @@ import io.druid.query.QueryInterruptedException;
 import io.druid.query.QuerySegmentWalker;
 import io.druid.server.initialization.ServerConfig;
 import io.druid.server.log.RequestLogger;
+import io.druid.server.security.Access;
+import io.druid.server.security.Action;
+import io.druid.server.security.AuthConfig;
+import io.druid.server.security.AuthorizationInfo;
+import io.druid.server.security.Resource;
+import io.druid.server.security.ResourceType;
 import org.joda.time.DateTime;
 
 import javax.servlet.http.HttpServletRequest;
@@ -60,6 +69,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -71,6 +81,8 @@ public class QueryResource
   @Deprecated // use SmileMediaTypes.APPLICATION_JACKSON_SMILE
   private static final String APPLICATION_SMILE = "application/smile";
 
+  private static final int RESPONSE_CTX_HEADER_LEN_LIMIT = 7*1024;
+
   private final ServerConfig config;
   private final ObjectMapper jsonMapper;
   private final ObjectMapper smileMapper;
@@ -78,6 +90,7 @@ public class QueryResource
   private final ServiceEmitter emitter;
   private final RequestLogger requestLogger;
   private final QueryManager queryManager;
+  private final AuthConfig authConfig;
 
   @Inject
   public QueryResource(
@@ -87,7 +100,8 @@ public class QueryResource
       QuerySegmentWalker texasRanger,
       ServiceEmitter emitter,
       RequestLogger requestLogger,
-      QueryManager queryManager
+      QueryManager queryManager,
+      AuthConfig authConfig
   )
   {
     this.config = config;
@@ -97,16 +111,41 @@ public class QueryResource
     this.emitter = emitter;
     this.requestLogger = requestLogger;
     this.queryManager = queryManager;
+    this.authConfig = authConfig;
   }
 
   @DELETE
   @Path("{id}")
   @Produces(MediaType.APPLICATION_JSON)
-  public Response getServer(@PathParam("id") String queryId)
+  public Response getServer(@PathParam("id") String queryId, @Context final HttpServletRequest req)
   {
+    if (log.isDebugEnabled()) {
+      log.debug("Received cancel request for query [%s]", queryId);
+    }
+    if (authConfig.isEnabled()) {
+      // This is an experimental feature, see - https://github.com/druid-io/druid/pull/2424
+      final AuthorizationInfo authorizationInfo = (AuthorizationInfo) req.getAttribute(AuthConfig.DRUID_AUTH_TOKEN);
+      Preconditions.checkNotNull(
+          authorizationInfo,
+          "Security is enabled but no authorization info found in the request"
+      );
+      Set<String> datasources = queryManager.getQueryDatasources(queryId);
+      if (datasources == null) {
+        log.warn("QueryId [%s] not registered with QueryManager, cannot cancel", queryId);
+      } else {
+        for (String dataSource : datasources) {
+          Access authResult = authorizationInfo.isAuthorized(
+              new Resource(dataSource, ResourceType.DATASOURCE),
+              Action.WRITE
+          );
+          if (!authResult.isAllowed()) {
+            return Response.status(Response.Status.FORBIDDEN).header("Access-Check-Result", authResult).build();
+          }
+        }
+      }
+    }
     queryManager.cancelQuery(queryId);
     return Response.status(Response.Status.ACCEPTED).build();
-
   }
 
   @POST
@@ -115,7 +154,7 @@ public class QueryResource
   public Response doPost(
       InputStream in,
       @QueryParam("pretty") String pretty,
-      @Context final HttpServletRequest req // used only to get request content-type and remote address
+      @Context final HttpServletRequest req // used to get request content-type, remote address and AuthorizationInfo
   ) throws IOException
   {
     final long start = System.currentTimeMillis();
@@ -132,6 +171,7 @@ public class QueryResource
                                     ? objectMapper.writerWithDefaultPrettyPrinter()
                                     : objectMapper.writer();
 
+    final String currThreadName = Thread.currentThread().getName();
     try {
       query = objectMapper.readValue(in, Query.class);
       queryId = query.getId();
@@ -148,8 +188,28 @@ public class QueryResource
         );
       }
 
+      Thread.currentThread()
+            .setName(String.format("%s[%s_%s_%s]", currThreadName, query.getType(), query.getDataSource(), queryId));
       if (log.isDebugEnabled()) {
         log.debug("Got query [%s]", query);
+      }
+
+      if (authConfig.isEnabled()) {
+        // This is an experimental feature, see - https://github.com/druid-io/druid/pull/2424
+        AuthorizationInfo authorizationInfo = (AuthorizationInfo) req.getAttribute(AuthConfig.DRUID_AUTH_TOKEN);
+        if (authorizationInfo != null) {
+          for (String dataSource : query.getDataSource().getNames()) {
+            Access authResult = authorizationInfo.isAuthorized(
+                new Resource(dataSource, ResourceType.DATASOURCE),
+                Action.READ
+            );
+            if (!authResult.isAllowed()) {
+              return Response.status(Response.Status.FORBIDDEN).header("Access-Check-Result", authResult).build();
+            }
+          }
+        } else {
+          throw new ISE("WTF?! Security is enabled but no authorization info found in the request");
+        }
       }
 
       final Map<String, Object> responseContext = new MapMaker().makeMap();
@@ -176,7 +236,7 @@ public class QueryResource
 
       try {
         final Query theQuery = query;
-        return Response
+        Response.ResponseBuilder builder = Response
             .ok(
                 new StreamingOutput()
                 {
@@ -184,24 +244,32 @@ public class QueryResource
                   public void write(OutputStream outputStream) throws IOException, WebApplicationException
                   {
                     // json serializer will always close the yielder
-                    jsonWriter.writeValue(outputStream, yielder);
-                    outputStream.flush(); // Some types of OutputStream suppress flush errors in the .close() method.
-                    outputStream.close();
+                    CountingOutputStream os = new CountingOutputStream(outputStream);
+                    jsonWriter.writeValue(os, yielder);
+
+                    os.flush(); // Some types of OutputStream suppress flush errors in the .close() method.
+                    os.close();
 
                     final long queryTime = System.currentTimeMillis() - start;
                     emitter.emit(
                         DruidMetrics.makeQueryTimeMetric(jsonMapper, theQuery, req.getRemoteAddr())
-                                       .build("query/time", queryTime)
+                                    .setDimension("success", "true")
+                                    .build("query/time", queryTime)
+                    );
+                    emitter.emit(
+                        DruidMetrics.makeQueryTimeMetric(jsonMapper, theQuery, req.getRemoteAddr())
+                                    .build("query/bytes", os.getCount())
                     );
 
                     requestLogger.log(
                         new RequestLogLine(
-                            new DateTime(),
+                            new DateTime(start),
                             req.getRemoteAddr(),
                             theQuery,
                             new QueryStats(
                                 ImmutableMap.<String, Object>of(
                                     "query/time", queryTime,
+                                    "query/bytes", os.getCount(),
                                     "success", true
                                 )
                             )
@@ -211,8 +279,19 @@ public class QueryResource
                 },
                 contentType
             )
-            .header("X-Druid-Query-Id", queryId)
-            .header("X-Druid-Response-Context", jsonMapper.writeValueAsString(responseContext))
+            .header("X-Druid-Query-Id", queryId);
+
+        //Limit the response-context header, see https://github.com/druid-io/druid/issues/2331
+        //Note that Response.ResponseBuilder.header(String key,Object value).build() calls value.toString()
+        //and encodes the string using ASCII, so 1 char is = 1 byte
+        String responseCtxString = jsonMapper.writeValueAsString(responseContext);
+        if (responseCtxString.length() > RESPONSE_CTX_HEADER_LEN_LIMIT) {
+          log.warn("Response Context truncated for id [%s] . Full context is [%s].", queryId, responseCtxString);
+          responseCtxString = responseCtxString.substring(0, RESPONSE_CTX_HEADER_LEN_LIMIT);
+        }
+
+        return builder
+            .header("X-Druid-Response-Context", responseCtxString)
             .build();
       }
       catch (Exception e) {
@@ -228,13 +307,21 @@ public class QueryResource
     catch (QueryInterruptedException e) {
       try {
         log.info("%s [%s]", e.getMessage(), queryId);
+        final long queryTime = System.currentTimeMillis() - start;
+        emitter.emit(
+            DruidMetrics.makeQueryTimeMetric(jsonMapper, query, req.getRemoteAddr())
+                        .setDimension("success", "false")
+                        .build("query/time", queryTime)
+        );
         requestLogger.log(
             new RequestLogLine(
-                new DateTime(),
+                new DateTime(start),
                 req.getRemoteAddr(),
                 query,
                 new QueryStats(
                     ImmutableMap.<String, Object>of(
+                        "query/time",
+                        queryTime,
                         "success",
                         false,
                         "interrupted",
@@ -267,12 +354,25 @@ public class QueryResource
       log.warn(e, "Exception occurred on request [%s]", queryString);
 
       try {
+        final long queryTime = System.currentTimeMillis() - start;
+        emitter.emit(
+            DruidMetrics.makeQueryTimeMetric(jsonMapper, query, req.getRemoteAddr())
+                        .setDimension("success", "false")
+                        .build("query/time", queryTime)
+        );
         requestLogger.log(
             new RequestLogLine(
-                new DateTime(),
+                new DateTime(start),
                 req.getRemoteAddr(),
                 query,
-                new QueryStats(ImmutableMap.<String, Object>of("success", false, "exception", e.toString()))
+                new QueryStats(ImmutableMap.<String, Object>of(
+                    "query/time",
+                    queryTime,
+                    "success",
+                    false,
+                    "exception",
+                    e.toString()
+                ))
             )
         );
       }
@@ -293,6 +393,9 @@ public class QueryResource
               )
           )
       ).build();
+    }
+    finally {
+      Thread.currentThread().setName(currThreadName);
     }
   }
 }

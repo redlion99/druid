@@ -29,8 +29,8 @@ import io.druid.indexing.common.IndexingServiceCondition;
 import io.druid.indexing.common.SegmentLoaderFactory;
 import io.druid.indexing.common.TaskStatus;
 import io.druid.indexing.common.TaskToolboxFactory;
-import io.druid.indexing.common.TestMergeTask;
 import io.druid.indexing.common.TestRealtimeTask;
+import io.druid.indexing.common.TestTasks;
 import io.druid.indexing.common.TestUtils;
 import io.druid.indexing.common.actions.TaskActionClient;
 import io.druid.indexing.common.actions.TaskActionClientFactory;
@@ -38,13 +38,14 @@ import io.druid.indexing.common.config.TaskConfig;
 import io.druid.indexing.common.task.Task;
 import io.druid.indexing.overlord.TestRemoteTaskRunnerConfig;
 import io.druid.indexing.overlord.ThreadPoolTaskRunner;
-import io.druid.indexing.worker.config.WorkerConfig;
 import io.druid.segment.IndexIO;
 import io.druid.segment.IndexMerger;
+import io.druid.segment.IndexMergerV9;
 import io.druid.segment.loading.SegmentLoaderConfig;
 import io.druid.segment.loading.SegmentLoaderLocalCacheManager;
 import io.druid.segment.loading.StorageLocationConfig;
 import io.druid.segment.realtime.plumber.SegmentHandoffNotifierFactory;
+import io.druid.server.DruidNode;
 import io.druid.server.initialization.IndexerZkConfig;
 import io.druid.server.initialization.ZkPathsConfig;
 import io.druid.server.metrics.NoopServiceEmitter;
@@ -53,6 +54,7 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingCluster;
 import org.easymock.EasyMock;
+import org.joda.time.DateTime;
 import org.joda.time.Period;
 import org.junit.After;
 import org.junit.Assert;
@@ -69,17 +71,19 @@ public class WorkerTaskMonitorTest
   private static final String basePath = "/test/druid";
   private static final String tasksPath = String.format("%s/indexer/tasks/worker", basePath);
   private static final String statusPath = String.format("%s/indexer/status/worker", basePath);
+  private static final DruidNode DUMMY_NODE = new DruidNode("dummy", "dummy", 9000);
 
   private TestingCluster testingCluster;
   private CuratorFramework cf;
   private WorkerCuratorCoordinator workerCuratorCoordinator;
   private WorkerTaskMonitor workerTaskMonitor;
 
-  private TestMergeTask task;
+  private Task task;
 
   private Worker worker;
   private ObjectMapper jsonMapper;
   private IndexMerger indexMerger;
+  private IndexMergerV9 indexMergerV9;
   private IndexIO indexIO;
 
   public WorkerTaskMonitorTest()
@@ -87,6 +91,7 @@ public class WorkerTaskMonitorTest
     TestUtils testUtils = new TestUtils();
     jsonMapper = testUtils.getTestObjectMapper();
     indexMerger = testUtils.getTestIndexMerger();
+    indexMergerV9 = testUtils.getTestIndexMergerV9();
     indexIO = testUtils.getTestIndexIO();
   }
 
@@ -102,6 +107,7 @@ public class WorkerTaskMonitorTest
                                 .compressionProvider(new PotentiallyGzippedCompressionProvider(false))
                                 .build();
     cf.start();
+    cf.blockUntilConnected();
     cf.create().creatingParentsIfNeeded().forPath(basePath);
 
     worker = new Worker(
@@ -132,16 +138,25 @@ public class WorkerTaskMonitorTest
 
     // Start a task monitor
     workerTaskMonitor = createTaskMonitor();
-    jsonMapper.registerSubtypes(new NamedType(TestMergeTask.class, "test"));
+    TestTasks.registerSubtypes(jsonMapper);
     jsonMapper.registerSubtypes(new NamedType(TestRealtimeTask.class, "test_realtime"));
     workerTaskMonitor.start();
 
-    task = TestMergeTask.createDummyTask("test");
+    task = TestTasks.immediateSuccess("test");
   }
 
   private WorkerTaskMonitor createTaskMonitor()
   {
-    final TaskConfig taskConfig = new TaskConfig(Files.createTempDir().toString(), null, null, 0, null, null, null);
+    final TaskConfig taskConfig = new TaskConfig(
+        Files.createTempDir().toString(),
+        null,
+        null,
+        0,
+        null,
+        false,
+        null,
+        null
+    );
     TaskActionClientFactory taskActionClientFactory = EasyMock.createNiceMock(TaskActionClientFactory.class);
     TaskActionClient taskActionClient = EasyMock.createNiceMock(TaskActionClient.class);
     EasyMock.expect(taskActionClientFactory.create(EasyMock.<Task>anyObject())).andReturn(taskActionClient).anyTimes();
@@ -173,30 +188,28 @@ public class WorkerTaskMonitorTest
                 indexMerger,
                 indexIO,
                 null,
-                null
+                null,
+                indexMergerV9
             ),
             taskConfig,
-            new NoopServiceEmitter()
-        ),
-        new WorkerConfig().setCapacity(1)
+            new NoopServiceEmitter(),
+            DUMMY_NODE
+        )
     );
   }
 
   @After
   public void tearDown() throws Exception
   {
+    workerCuratorCoordinator.stop();
     workerTaskMonitor.stop();
     cf.close();
     testingCluster.stop();
   }
 
-  @Test
+  @Test(timeout = 30_000L)
   public void testRunTask() throws Exception
   {
-    cf.create()
-      .creatingParentsIfNeeded()
-      .forPath(joiner.join(tasksPath, task.getId()), jsonMapper.writeValueAsBytes(task));
-
     Assert.assertTrue(
         TestUtils.conditionValid(
             new IndexingServiceCondition()
@@ -215,6 +228,10 @@ public class WorkerTaskMonitorTest
         )
     );
 
+    cf.create()
+      .creatingParentsIfNeeded()
+      .forPath(joiner.join(tasksPath, task.getId()), jsonMapper.writeValueAsBytes(task));
+
     Assert.assertTrue(
         TestUtils.conditionValid(
             new IndexingServiceCondition()
@@ -223,7 +240,12 @@ public class WorkerTaskMonitorTest
               public boolean isValid()
               {
                 try {
-                  return cf.checkExists().forPath(joiner.join(statusPath, task.getId())) != null;
+                  final byte[] bytes = cf.getData().forPath(joiner.join(statusPath, task.getId()));
+                  final TaskAnnouncement announcement = jsonMapper.readValue(
+                      bytes,
+                      TaskAnnouncement.class
+                  );
+                  return announcement.getTaskStatus().isComplete();
                 }
                 catch (Exception e) {
                   return false;
@@ -238,10 +260,10 @@ public class WorkerTaskMonitorTest
     );
 
     Assert.assertEquals(task.getId(), taskAnnouncement.getTaskStatus().getId());
-    Assert.assertEquals(TaskStatus.Status.RUNNING, taskAnnouncement.getTaskStatus().getStatusCode());
+    Assert.assertEquals(TaskStatus.Status.SUCCESS, taskAnnouncement.getTaskStatus().getStatusCode());
   }
 
-  @Test
+  @Test(timeout = 30_000L)
   public void testGetAnnouncements() throws Exception
   {
     cf.create()
@@ -256,7 +278,12 @@ public class WorkerTaskMonitorTest
               public boolean isValid()
               {
                 try {
-                  return cf.checkExists().forPath(joiner.join(statusPath, task.getId())) != null;
+                  final byte[] bytes = cf.getData().forPath(joiner.join(statusPath, task.getId()));
+                  final TaskAnnouncement announcement = jsonMapper.readValue(
+                      bytes,
+                      TaskAnnouncement.class
+                  );
+                  return announcement.getTaskStatus().isComplete();
                 }
                 catch (Exception e) {
                   return false;
@@ -269,12 +296,16 @@ public class WorkerTaskMonitorTest
     List<TaskAnnouncement> announcements = workerCuratorCoordinator.getAnnouncements();
     Assert.assertEquals(1, announcements.size());
     Assert.assertEquals(task.getId(), announcements.get(0).getTaskStatus().getId());
-    Assert.assertEquals(TaskStatus.Status.RUNNING, announcements.get(0).getTaskStatus().getStatusCode());
+    Assert.assertEquals(TaskStatus.Status.SUCCESS, announcements.get(0).getTaskStatus().getStatusCode());
+    Assert.assertEquals(DUMMY_NODE.getHost(), announcements.get(0).getTaskLocation().getHost());
+    Assert.assertEquals(DUMMY_NODE.getPort(), announcements.get(0).getTaskLocation().getPort());
   }
 
-  @Test
+  @Test(timeout = 30_000L)
   public void testRestartCleansOldStatus() throws Exception
   {
+    task = TestTasks.unending("test");
+
     cf.create()
       .creatingParentsIfNeeded()
       .forPath(joiner.join(tasksPath, task.getId()), jsonMapper.writeValueAsBytes(task));
@@ -306,7 +337,7 @@ public class WorkerTaskMonitorTest
     Assert.assertEquals(TaskStatus.Status.FAILED, announcements.get(0).getTaskStatus().getStatusCode());
   }
 
-  @Test
+  @Test(timeout = 30_000L)
   public void testStatusAnnouncementsArePersistent() throws Exception
   {
     cf.create()
@@ -330,7 +361,7 @@ public class WorkerTaskMonitorTest
             }
         )
     );
-    // ephermal owner is 0 is created node is PERSISTENT
+    // ephemeral owner is 0 is created node is PERSISTENT
     Assert.assertEquals(0, cf.checkExists().forPath(joiner.join(statusPath, task.getId())).getEphemeralOwner());
 
   }

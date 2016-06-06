@@ -23,7 +23,6 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Lists;
 import com.metamx.common.ISE;
-import com.metamx.common.guava.Comparators;
 import com.metamx.emitter.EmittingLogger;
 import io.druid.server.coordination.DataSegmentChangeRequest;
 import io.druid.server.coordination.SegmentChangeRequestDrop;
@@ -39,7 +38,6 @@ import org.apache.zookeeper.data.Stat;
 
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -57,8 +55,6 @@ public class LoadQueuePeon
   private static final int DROP = 0;
   private static final int LOAD = 1;
 
-  private static Comparator<DataSegment> segmentComparator = Comparators.inverse(DataSegment.bucketMonthComparator());
-
   private static void executeCallbacks(List<LoadPeonCallback> callbacks)
   {
     for (LoadPeonCallback callback : callbacks) {
@@ -71,7 +67,7 @@ public class LoadQueuePeon
   private final CuratorFramework curator;
   private final String basePath;
   private final ObjectMapper jsonMapper;
-  private final ScheduledExecutorService zkWritingExecutor;
+  private final ScheduledExecutorService processingExecutor;
   private final ExecutorService callBackExecutor;
   private final DruidCoordinatorConfig config;
 
@@ -79,10 +75,10 @@ public class LoadQueuePeon
   private final AtomicInteger failedAssignCount = new AtomicInteger(0);
 
   private final ConcurrentSkipListMap<DataSegment, SegmentHolder> segmentsToLoad = new ConcurrentSkipListMap<>(
-      segmentComparator
+      DruidCoordinator.SEGMENT_COMPARATOR
   );
   private final ConcurrentSkipListMap<DataSegment, SegmentHolder> segmentsToDrop = new ConcurrentSkipListMap<>(
-      segmentComparator
+      DruidCoordinator.SEGMENT_COMPARATOR
   );
 
   private final Object lock = new Object();
@@ -94,7 +90,7 @@ public class LoadQueuePeon
       CuratorFramework curator,
       String basePath,
       ObjectMapper jsonMapper,
-      ScheduledExecutorService zkWritingExecutor,
+      ScheduledExecutorService processingExecutor,
       ExecutorService callbackExecutor,
       DruidCoordinatorConfig config
   )
@@ -103,7 +99,7 @@ public class LoadQueuePeon
     this.basePath = basePath;
     this.jsonMapper = jsonMapper;
     this.callBackExecutor = callbackExecutor;
-    this.zkWritingExecutor = zkWritingExecutor;
+    this.processingExecutor = processingExecutor;
     this.config = config;
   }
 
@@ -204,7 +200,7 @@ public class LoadQueuePeon
           return;
         }
 
-        zkWritingExecutor.execute(
+        processingExecutor.execute(
             new Runnable()
             {
               @Override
@@ -227,7 +223,7 @@ public class LoadQueuePeon
                     final byte[] payload = jsonMapper.writeValueAsBytes(currentlyProcessing.getChangeRequest());
                     curator.create().withMode(CreateMode.EPHEMERAL).forPath(path, payload);
 
-                    zkWritingExecutor.schedule(
+                    processingExecutor.schedule(
                         new Runnable()
                         {
                           @Override

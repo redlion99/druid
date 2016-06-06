@@ -23,6 +23,7 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Preconditions;
 import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.query.BaseQuery;
 import io.druid.query.DataSource;
 import io.druid.query.Query;
@@ -59,10 +60,10 @@ public class SearchQuery extends BaseQuery<Result<SearchResultValue>>
       @JsonProperty("context") Map<String, Object> context
   )
   {
-    super(dataSource, querySegmentSpec, context);
+    super(dataSource, querySegmentSpec, false, context);
     this.dimFilter = dimFilter;
     this.sortSpec = sortSpec == null ? new LexicographicSearchSortSpec() : sortSpec;
-    this.granularity = granularity == null ? QueryGranularity.ALL : granularity;
+    this.granularity = granularity == null ? QueryGranularities.ALL : granularity;
     this.limit = (limit == 0) ? 1000 : limit;
     this.dimensions = dimensions;
     this.querySpec = querySpec;
@@ -128,6 +129,21 @@ public class SearchQuery extends BaseQuery<Result<SearchResultValue>>
         querySpec,
         sortSpec,
         computeOverridenContext(contextOverrides)
+    );
+  }
+
+  public SearchQuery withDimFilter(DimFilter dimFilter)
+  {
+    return new SearchQuery(
+        getDataSource(),
+        dimFilter,
+        granularity,
+        limit,
+        getQuerySegmentSpec(),
+        dimensions,
+        querySpec,
+        sortSpec,
+        getContext()
     );
   }
 

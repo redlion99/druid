@@ -21,6 +21,7 @@ package io.druid.cli;
 
 import com.google.common.collect.ImmutableList;
 import com.google.inject.Binder;
+import com.google.inject.Inject;
 import com.google.inject.Module;
 import com.google.inject.name.Names;
 import com.metamx.common.logger.Logger;
@@ -30,13 +31,16 @@ import io.druid.client.InventoryView;
 import io.druid.client.ServerView;
 import io.druid.guice.LazySingleton;
 import io.druid.guice.RealtimeModule;
+import io.druid.query.lookup.LookupModule;
 import io.druid.segment.loading.DataSegmentPusher;
 import io.druid.server.coordination.DataSegmentAnnouncer;
+import io.druid.server.initialization.jetty.ChatHandlerServerModule;
 import io.druid.timeline.DataSegment;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.Executor;
 
 /**
@@ -49,6 +53,9 @@ public class CliRealtimeExample extends ServerRunnable
 {
   private static final Logger log = new Logger(CliBroker.class);
 
+  @Inject
+  private Properties properties;
+
   public CliRealtimeExample()
   {
     super(log);
@@ -57,7 +64,7 @@ public class CliRealtimeExample extends ServerRunnable
   @Override
   protected List<? extends Module> getModules()
   {
-    return ImmutableList.<Module>of(
+    return ImmutableList.of(
         new RealtimeModule(),
         new Module()
         {
@@ -72,7 +79,9 @@ public class CliRealtimeExample extends ServerRunnable
             binder.bind(InventoryView.class).to(NoopInventoryView.class).in(LazySingleton.class);
             binder.bind(ServerView.class).to(NoopServerView.class).in(LazySingleton.class);
           }
-        }
+        },
+        new ChatHandlerServerModule(properties),
+        new LookupModule()
     );
   }
 
@@ -149,6 +158,12 @@ public class CliRealtimeExample extends ServerRunnable
     public void unannounceSegments(Iterable<DataSegment> segments) throws IOException
     {
       // do nothing
+    }
+
+    @Override
+    public boolean isAnnounced(DataSegment segment)
+    {
+      return false;
     }
   }
 }

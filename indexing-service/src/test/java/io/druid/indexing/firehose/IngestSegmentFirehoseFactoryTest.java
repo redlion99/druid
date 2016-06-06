@@ -44,7 +44,7 @@ import io.druid.data.input.impl.JSONParseSpec;
 import io.druid.data.input.impl.MapInputRowParser;
 import io.druid.data.input.impl.SpatialDimensionSchema;
 import io.druid.data.input.impl.TimestampSpec;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.guice.GuiceAnnotationIntrospector;
 import io.druid.guice.GuiceInjectableValues;
 import io.druid.guice.GuiceInjectors;
@@ -64,6 +64,7 @@ import io.druid.query.aggregation.LongSumAggregatorFactory;
 import io.druid.query.filter.SelectorDimFilter;
 import io.druid.segment.IndexIO;
 import io.druid.segment.IndexMerger;
+import io.druid.segment.IndexMergerV9;
 import io.druid.segment.IndexSpec;
 import io.druid.segment.incremental.IncrementalIndexSchema;
 import io.druid.segment.incremental.OnheapIncrementalIndex;
@@ -109,12 +110,14 @@ public class IngestSegmentFirehoseFactoryTest
 {
   private static final ObjectMapper MAPPER;
   private static final IndexMerger INDEX_MERGER;
+  private static final IndexMergerV9 INDEX_MERGER_V9;
   private static final IndexIO INDEX_IO;
 
   static {
     TestUtils testUtils = new TestUtils();
     MAPPER = setupInjectablesInObjectMapper(testUtils.getTestObjectMapper());
     INDEX_MERGER = testUtils.getTestIndexMerger();
+    INDEX_MERGER_V9 = testUtils.getTestIndexMergerV9();
     INDEX_IO = testUtils.getTestIndexIO();
   }
 
@@ -129,7 +132,7 @@ public class IngestSegmentFirehoseFactoryTest
         }
     );
     final IncrementalIndexSchema schema = new IncrementalIndexSchema.Builder()
-        .withQueryGranularity(QueryGranularity.NONE)
+        .withQueryGranularity(QueryGranularities.NONE)
         .withMinTimestamp(JodaUtils.MIN_INSTANT)
         .withDimensionsSpec(ROW_PARSER)
         .withMetrics(
@@ -141,6 +144,7 @@ public class IngestSegmentFirehoseFactoryTest
         .build();
     final OnheapIncrementalIndex index = new OnheapIncrementalIndex(
         schema,
+        true,
         MAX_ROWS * MAX_SHARD_NUMBER
     );
 
@@ -151,7 +155,7 @@ public class IngestSegmentFirehoseFactoryTest
     if (!persistDir.mkdirs() && !persistDir.exists()) {
       throw new IOException(String.format("Could not create directory at [%s]", persistDir.getAbsolutePath()));
     }
-    INDEX_MERGER.persist(index, persistDir, null, indexSpec);
+    INDEX_MERGER.persist(index, persistDir, indexSpec);
 
     final TaskLockbox tl = new TaskLockbox(ts);
     final IndexerSQLMetadataStorageCoordinator mdc = new IndexerSQLMetadataStorageCoordinator(null, null, null)
@@ -204,7 +208,7 @@ public class IngestSegmentFirehoseFactoryTest
     EasyMock.replay(notifierFactory);
 
     final TaskToolboxFactory taskToolboxFactory = new TaskToolboxFactory(
-        new TaskConfig(tmpDir.getAbsolutePath(), null, null, 50000, null, null, null),
+        new TaskConfig(tmpDir.getAbsolutePath(), null, null, 50000, null, false, null, null),
         tac,
         newMockEmitter(),
         new DataSegmentPusher()
@@ -274,7 +278,8 @@ public class IngestSegmentFirehoseFactoryTest
         INDEX_MERGER,
         INDEX_IO,
         null,
-        null
+        null,
+        INDEX_MERGER_V9
     );
     Collection<Object[]> values = new LinkedList<>();
     for (InputRowParser parser : Arrays.<InputRowParser>asList(
@@ -283,7 +288,7 @@ public class IngestSegmentFirehoseFactoryTest
             new JSONParseSpec(
                 new TimestampSpec(TIME_COLUMN, "auto", null),
                 new DimensionsSpec(
-                    ImmutableList.<String>of(),
+                    DimensionsSpec.getDefaultSchemas(ImmutableList.<String>of()),
                     ImmutableList.of(DIM_FLOAT_NAME, DIM_LONG_NAME),
                     ImmutableList.<SpatialDimensionSchema>of()
                 )
@@ -300,7 +305,7 @@ public class IngestSegmentFirehoseFactoryTest
                   new IngestSegmentFirehoseFactory(
                       DATA_SOURCE_NAME,
                       FOREVER,
-                      new SelectorDimFilter(DIM_NAME, DIM_VALUE),
+                      new SelectorDimFilter(DIM_NAME, DIM_VALUE, null),
                       dim_names,
                       metric_names,
                       Guice.createInjector(
@@ -401,7 +406,7 @@ public class IngestSegmentFirehoseFactoryTest
       new JSONParseSpec(
           new TimestampSpec(TIME_COLUMN, "auto", null),
           new DimensionsSpec(
-              ImmutableList.of(DIM_NAME),
+              DimensionsSpec.getDefaultSchemas(ImmutableList.of(DIM_NAME)),
               ImmutableList.of(DIM_FLOAT_NAME, DIM_LONG_NAME),
               ImmutableList.<SpatialDimensionSchema>of()
           )

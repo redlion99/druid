@@ -20,20 +20,25 @@
 package io.druid.segment.incremental;
 
 import com.google.common.base.Supplier;
-import com.google.common.collect.BiMap;
-import com.google.common.collect.HashBiMap;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.metamx.common.ISE;
+import com.metamx.common.logger.Logger;
+import com.metamx.common.parsers.ParseException;
 import io.druid.data.input.InputRow;
 import io.druid.granularity.QueryGranularity;
 import io.druid.query.aggregation.Aggregator;
 import io.druid.query.aggregation.AggregatorFactory;
+import io.druid.query.dimension.DimensionSpec;
+import io.druid.segment.ColumnSelectorFactory;
+import io.druid.segment.DimensionSelector;
+import io.druid.segment.FloatColumnSelector;
+import io.druid.segment.LongColumnSelector;
+import io.druid.segment.ObjectColumnSelector;
 
-import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -41,21 +46,32 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
 {
+  private static final Logger log = new Logger(OnheapIncrementalIndex.class);
+
   private final ConcurrentHashMap<Integer, Aggregator[]> aggregators = new ConcurrentHashMap<>();
-  private final ConcurrentNavigableMap<TimeAndDims, Integer> facts = new ConcurrentSkipListMap<>();
+  private final ConcurrentMap<TimeAndDims, Integer> facts;
   private final AtomicInteger indexIncrement = new AtomicInteger(0);
   protected final int maxRowCount;
+  private volatile Map<String, ColumnSelectorFactory> selectors;
 
   private String outOfRowsReason = null;
 
   public OnheapIncrementalIndex(
       IncrementalIndexSchema incrementalIndexSchema,
       boolean deserializeComplexMetrics,
+      boolean reportParseExceptions,
+      boolean sortFacts,
       int maxRowCount
   )
   {
-    super(incrementalIndexSchema, deserializeComplexMetrics);
+    super(incrementalIndexSchema, deserializeComplexMetrics, reportParseExceptions, sortFacts);
     this.maxRowCount = maxRowCount;
+
+    if (sortFacts) {
+      this.facts = new ConcurrentSkipListMap<>(dimsComparator());
+    } else {
+      this.facts = new ConcurrentHashMap<>();
+    }
   }
 
   public OnheapIncrementalIndex(
@@ -63,6 +79,8 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
       QueryGranularity gran,
       final AggregatorFactory[] metrics,
       boolean deserializeComplexMetrics,
+      boolean reportParseExceptions,
+      boolean sortFacts,
       int maxRowCount
   )
   {
@@ -72,6 +90,8 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
                                             .withMetrics(metrics)
                                             .build(),
         deserializeComplexMetrics,
+        reportParseExceptions,
+        sortFacts,
         maxRowCount
     );
   }
@@ -89,28 +109,31 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
                                             .withMetrics(metrics)
                                             .build(),
         true,
+        true,
+        true,
         maxRowCount
     );
   }
 
   public OnheapIncrementalIndex(
       IncrementalIndexSchema incrementalIndexSchema,
+      boolean reportParseExceptions,
       int maxRowCount
   )
   {
-    this(incrementalIndexSchema, true, maxRowCount);
+    this(incrementalIndexSchema, true, reportParseExceptions, true, maxRowCount);
   }
 
   @Override
-  public ConcurrentNavigableMap<TimeAndDims, Integer> getFacts()
+  public ConcurrentMap<TimeAndDims, Integer> getFacts()
   {
     return facts;
   }
 
   @Override
-  protected DimDim makeDimDim(String dimension)
+  protected DimDim makeDimDim(String dimension, Object lock)
   {
-    return new OnHeapDimDim();
+    return new OnHeapDimDim(lock);
   }
 
   @Override
@@ -118,6 +141,14 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
       AggregatorFactory[] metrics, Supplier<InputRow> rowSupplier, boolean deserializeComplexMetrics
   )
   {
+    selectors = Maps.newHashMap();
+    for (AggregatorFactory agg : metrics) {
+      selectors.put(
+          agg.getName(),
+          new ObjectCachingColumnSelectorFactory(makeColumnSelectorFactory(agg, rowSupplier, deserializeComplexMetrics))
+      );
+    }
+
     return new Aggregator[metrics.length];
   }
 
@@ -125,6 +156,7 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
   protected Integer addToFacts(
       AggregatorFactory[] metrics,
       boolean deserializeComplexMetrics,
+      boolean reportParseExceptions,
       InputRow row,
       AtomicInteger numEntries,
       TimeAndDims key,
@@ -138,17 +170,13 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
 
     if (null != priorIndex) {
       aggs = concurrentGet(priorIndex);
+      doAggregate(aggs, rowContainer, row, reportParseExceptions);
     } else {
       aggs = new Aggregator[metrics.length];
+      factorizeAggs(metrics, aggs, rowContainer, row);
+      doAggregate(aggs, rowContainer, row, reportParseExceptions);
 
-      for (int i = 0; i < metrics.length; i++) {
-        final AggregatorFactory agg = metrics[i];
-        aggs[i] = agg.factorize(
-            makeColumnSelectorFactory(agg, rowSupplier, deserializeComplexMetrics)
-        );
-      }
       final Integer rowIndex = indexIncrement.getAndIncrement();
-
       concurrentSet(rowIndex, aggs);
 
       // Last ditch sanity checks
@@ -161,24 +189,57 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
       } else {
         // We lost a race
         aggs = concurrentGet(prev);
+        doAggregate(aggs, rowContainer, row, reportParseExceptions);
         // Free up the misfire
         concurrentRemove(rowIndex);
         // This is expected to occur ~80% of the time in the worst scenarios
       }
     }
 
+    return numEntries.get();
+  }
+
+  private void factorizeAggs(
+      AggregatorFactory[] metrics,
+      Aggregator[] aggs,
+      ThreadLocal<InputRow> rowContainer,
+      InputRow row
+  )
+  {
+    rowContainer.set(row);
+    for (int i = 0; i < metrics.length; i++) {
+      final AggregatorFactory agg = metrics[i];
+      aggs[i] = agg.factorize(selectors.get(agg.getName()));
+    }
+    rowContainer.set(null);
+  }
+
+  private void doAggregate(
+      Aggregator[] aggs,
+      ThreadLocal<InputRow> rowContainer,
+      InputRow row,
+      boolean reportParseExceptions
+  )
+  {
     rowContainer.set(row);
 
     for (Aggregator agg : aggs) {
       synchronized (agg) {
-        agg.aggregate();
+        try {
+          agg.aggregate();
+        }
+        catch (ParseException e) {
+          // "aggregate" can throw ParseExceptions if a selector expects something but gets something else.
+          if (reportParseExceptions) {
+            throw new ParseException(e, "Encountered parse error for aggregator[%s]", agg.getName());
+          } else {
+            log.debug(e, "Encountered parse error, skipping aggregator[%s].", agg.getName());
+          }
+        }
       }
     }
 
     rowContainer.set(null);
-
-
-    return numEntries.get();
   }
 
   protected Aggregator[] concurrentGet(int offset)
@@ -243,94 +304,216 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
     return concurrentGet(rowOffset)[aggOffset].get();
   }
 
-  private static class OnHeapDimDim implements DimDim
+  /**
+   * Clear out maps to allow GC
+   * NOTE: This is NOT thread-safe with add... so make sure all the adding is DONE before closing
+   */
+  @Override
+  public void close()
   {
-    private final Map<String, Integer> falseIds;
-    private final Map<Integer, String> falseIdsReverse;
-    private volatile String[] sortedVals = null;
-    final ConcurrentMap<String, String> poorMansInterning = Maps.newConcurrentMap();
+    super.close();
+    aggregators.clear();
+    facts.clear();
+    if (selectors != null) {
+      selectors.clear();
+    }
+  }
 
-    public OnHeapDimDim()
+  static class OnHeapDimDim<T extends Comparable<? super T>> implements DimDim<T>
+  {
+    private final Map<T, Integer> valueToId = Maps.newHashMap();
+    private T minValue = null;
+    private T maxValue = null;
+
+    private final List<T> idToValue = Lists.newArrayList();
+    private final Object lock;
+
+    public OnHeapDimDim(Object lock)
     {
-      BiMap<String, Integer> biMap = Maps.synchronizedBiMap(HashBiMap.<String, Integer>create());
-      falseIds = biMap;
-      falseIdsReverse = biMap.inverse();
+      this.lock = lock;
     }
 
-    /**
-     * Returns the interned String value to allow fast comparisons using `==` instead of `.equals()`
-     *
-     * @see io.druid.segment.incremental.IncrementalIndexStorageAdapter.EntryHolderValueMatcherFactory#makeValueMatcher(String, String)
-     */
-    public String get(String str)
+    public int getId(T value)
     {
-      String prev = poorMansInterning.putIfAbsent(str, str);
-      return prev != null ? prev : str;
+      synchronized (lock) {
+        final Integer id = valueToId.get(value);
+        return id == null ? -1 : id;
+      }
     }
 
-    public int getId(String value)
+    public T getValue(int id)
     {
-      final Integer id = falseIds.get(value);
-      return id == null ? -1 : id;
+      synchronized (lock) {
+        return idToValue.get(id);
+      }
     }
 
-    public String getValue(int id)
+    public boolean contains(T value)
     {
-      return falseIdsReverse.get(id);
-    }
-
-    public boolean contains(String value)
-    {
-      return falseIds.containsKey(value);
+      synchronized (lock) {
+        return valueToId.containsKey(value);
+      }
     }
 
     public int size()
     {
-      return falseIds.size();
+      synchronized (lock) {
+        return valueToId.size();
+      }
     }
 
-    public synchronized int add(String value)
+    public int add(T value)
     {
-      int id = falseIds.size();
-      falseIds.put(value, id);
-      return id;
-    }
-
-    public int getSortedId(String value)
-    {
-      assertSorted();
-      return Arrays.binarySearch(sortedVals, value);
-    }
-
-    public String getSortedValue(int index)
-    {
-      assertSorted();
-      return sortedVals[index];
-    }
-
-    public void sort()
-    {
-      if (sortedVals == null) {
-        sortedVals = new String[falseIds.size()];
-
-        int index = 0;
-        for (String value : falseIds.keySet()) {
-          sortedVals[index++] = value;
+      synchronized (lock) {
+        Integer prev = valueToId.get(value);
+        if (prev != null) {
+          return prev;
         }
-        Arrays.sort(sortedVals);
+        final int index = size();
+        valueToId.put(value, index);
+        idToValue.add(value);
+        minValue = minValue == null || minValue.compareTo(value) > 0 ? value : minValue;
+        maxValue = maxValue == null || maxValue.compareTo(value) < 0 ? value : maxValue;
+        return index;
       }
     }
 
-    private void assertSorted()
+    @Override
+    public T getMinValue()
     {
-      if (sortedVals == null) {
-        throw new ISE("Call sort() before calling the getSorted* methods.");
-      }
+      return minValue;
     }
 
-    public boolean compareCannonicalValues(String s1, String s2)
+    @Override
+    public T getMaxValue()
     {
-      return s1 == s2;
+      return maxValue;
+    }
+
+    public OnHeapDimLookup sort()
+    {
+      synchronized (lock) {
+        return new OnHeapDimLookup(idToValue, size());
+      }
     }
   }
+
+  static class OnHeapDimLookup<T extends Comparable<? super T>> implements SortedDimLookup<T>
+  {
+    private final List<T> sortedVals;
+    private final int[] idToIndex;
+    private final int[] indexToId;
+
+    public OnHeapDimLookup(List<T> idToValue, int length)
+    {
+      Map<T, Integer> sortedMap = Maps.newTreeMap();
+      for (int id = 0; id < length; id++) {
+        sortedMap.put(idToValue.get(id), id);
+      }
+      this.sortedVals = Lists.newArrayList(sortedMap.keySet());
+      this.idToIndex = new int[length];
+      this.indexToId = new int[length];
+      int index = 0;
+      for (Integer id : sortedMap.values()) {
+        idToIndex[id] = index;
+        indexToId[index] = id;
+        index++;
+      }
+    }
+
+    @Override
+    public int size()
+    {
+      return sortedVals.size();
+    }
+
+    @Override
+    public int getUnsortedIdFromSortedId(int index)
+    {
+      return indexToId[index];
+    }
+
+    @Override
+    public T getValueFromSortedId(int index)
+    {
+      return sortedVals.get(index);
+    }
+
+    @Override
+    public int getSortedIdFromUnsortedId(int id)
+    {
+      return idToIndex[id];
+    }
+  }
+
+  // Caches references to selector objects for each column instead of creating a new object each time in order to save heap space.
+  // In general the selectorFactory need not to thread-safe.
+  // here its made thread safe to support the special case of groupBy where the multiple threads can add concurrently to the IncrementalIndex.
+  static class ObjectCachingColumnSelectorFactory implements ColumnSelectorFactory
+  {
+    private final ConcurrentMap<String, LongColumnSelector> longColumnSelectorMap = Maps.newConcurrentMap();
+    private final ConcurrentMap<String, FloatColumnSelector> floatColumnSelectorMap = Maps.newConcurrentMap();
+    private final ConcurrentMap<String, ObjectColumnSelector> objectColumnSelectorMap = Maps.newConcurrentMap();
+    private final ColumnSelectorFactory delegate;
+
+    public ObjectCachingColumnSelectorFactory(ColumnSelectorFactory delegate)
+    {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public DimensionSelector makeDimensionSelector(DimensionSpec dimensionSpec)
+    {
+      return delegate.makeDimensionSelector(dimensionSpec);
+    }
+
+    @Override
+    public FloatColumnSelector makeFloatColumnSelector(String columnName)
+    {
+      FloatColumnSelector existing = floatColumnSelectorMap.get(columnName);
+      if (existing != null) {
+        return existing;
+      } else {
+        FloatColumnSelector newSelector = delegate.makeFloatColumnSelector(columnName);
+        FloatColumnSelector prev = floatColumnSelectorMap.putIfAbsent(
+            columnName,
+            newSelector
+        );
+        return prev != null ? prev : newSelector;
+      }
+    }
+
+    @Override
+    public LongColumnSelector makeLongColumnSelector(String columnName)
+    {
+      LongColumnSelector existing = longColumnSelectorMap.get(columnName);
+      if (existing != null) {
+        return existing;
+      } else {
+        LongColumnSelector newSelector = delegate.makeLongColumnSelector(columnName);
+        LongColumnSelector prev = longColumnSelectorMap.putIfAbsent(
+            columnName,
+            newSelector
+        );
+        return prev != null ? prev : newSelector;
+      }
+    }
+
+    @Override
+    public ObjectColumnSelector makeObjectColumnSelector(String columnName)
+    {
+      ObjectColumnSelector existing = objectColumnSelectorMap.get(columnName);
+      if (existing != null) {
+        return existing;
+      } else {
+        ObjectColumnSelector newSelector = delegate.makeObjectColumnSelector(columnName);
+        ObjectColumnSelector prev = objectColumnSelectorMap.putIfAbsent(
+            columnName,
+            newSelector
+        );
+        return prev != null ? prev : newSelector;
+      }
+    }
+  }
+
 }

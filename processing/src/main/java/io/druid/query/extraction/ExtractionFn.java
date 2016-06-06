@@ -21,6 +21,8 @@ package io.druid.query.extraction;
 
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
+import io.druid.query.lookup.LookupExtractionFn;
+import io.druid.query.lookup.RegisteredLookupExtractionFn;
 
 /**
  */
@@ -30,11 +32,16 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
     @JsonSubTypes.Type(name = "regex", value = RegexDimExtractionFn.class),
     @JsonSubTypes.Type(name = "partial", value = MatchingDimExtractionFn.class),
     @JsonSubTypes.Type(name = "searchQuery", value = SearchQuerySpecDimExtractionFn.class),
-    @JsonSubTypes.Type(name = "javascript", value = JavascriptExtractionFn.class),
+    @JsonSubTypes.Type(name = "javascript", value = JavaScriptExtractionFn.class),
     @JsonSubTypes.Type(name = "timeFormat", value = TimeFormatExtractionFn.class),
     @JsonSubTypes.Type(name = "identity", value = IdentityExtractionFn.class),
     @JsonSubTypes.Type(name = "lookup", value = LookupExtractionFn.class),
-    @JsonSubTypes.Type(name = "substring", value = SubstringDimExtractionFn.class)
+    @JsonSubTypes.Type(name = "registeredLookup", value = RegisteredLookupExtractionFn.class),
+    @JsonSubTypes.Type(name = "substring", value = SubstringDimExtractionFn.class),
+    @JsonSubTypes.Type(name = "cascade", value = CascadeExtractionFn.class),
+    @JsonSubTypes.Type(name = "stringFormat", value = StringFormatExtractionFn.class),
+    @JsonSubTypes.Type(name = "upper", value = UpperExtractionFn.class),
+    @JsonSubTypes.Type(name = "lower", value = LowerExtractionFn.class)
 })
 /**
  * An ExtractionFn is a function that can be used to transform the values of a column (typically a dimension)
@@ -54,8 +61,8 @@ public interface ExtractionFn
   public byte[] getCacheKey();
 
   /**
-   * The "extraction" function.  This should map a value into some other String value.
-   *
+   * The "extraction" function.  This should map an Object into some String value.
+   * <p>
    * In order to maintain the "null and empty string are equivalent" semantics that Druid provides, the
    * empty string is considered invalid output for this method and should instead return null.  This is
    * a contract on the method rather than enforced at a lower level in order to eliminate a global check
@@ -67,13 +74,33 @@ public interface ExtractionFn
    */
   public String apply(Object value);
 
+  /**
+   * The "extraction" function.  This should map a String value into some other String value.
+   * <p>
+   * Like {@link #apply(Object)}, the empty string is considered invalid output for this method and it should
+   * instead return null.
+   *
+   * @param value the original value of the dimension
+   *
+   * @return a value that should be used instead of the original
+   */
   public String apply(String value);
 
+  /**
+   * The "extraction" function.  This should map a long value into some String value.
+   * <p>
+   * Like {@link #apply(Object)}, the empty string is considered invalid output for this method and it should
+   * instead return null.
+   *
+   * @param value the original value of the dimension
+   *
+   * @return a value that should be used instead of the original
+   */
   public String apply(long value);
 
   /**
    * Offers information on whether the extraction will preserve the original ordering of the values.
-   * <p/>
+   * <p>
    * Some optimizations of queries is possible if ordering is preserved.  Null values *do* count towards
    * ordering.
    *

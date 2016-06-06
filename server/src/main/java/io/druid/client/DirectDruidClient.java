@@ -52,6 +52,7 @@ import com.metamx.http.client.response.ClientResponse;
 import com.metamx.http.client.response.HttpResponseHandler;
 import com.metamx.http.client.response.StatusResponseHandler;
 import com.metamx.http.client.response.StatusResponseHolder;
+import io.druid.query.BaseQuery;
 import io.druid.query.BySegmentResultValueClass;
 import io.druid.query.DruidMetrics;
 import io.druid.query.Query;
@@ -134,7 +135,7 @@ public class DirectDruidClient<T> implements QueryRunner<T>
   public Sequence<T> run(final Query<T> query, final Map<String, Object> context)
   {
     QueryToolChest<T, Query<T>> toolChest = warehouse.getToolChest(query);
-    boolean isBySegment = query.getContextBySegment(false);
+    boolean isBySegment = BaseQuery.getContextBySegment(query, false);
 
     Pair<JavaType, JavaType> types = typesMap.get(query.getClass());
     if (types == null) {
@@ -159,7 +160,7 @@ public class DirectDruidClient<T> implements QueryRunner<T>
     final String cancelUrl = String.format("http://%s/druid/v2/%s", host, query.getId());
 
     try {
-      log.debug("Querying url[%s]", url);
+      log.debug("Querying queryId[%s] url[%s]", query.getId(), url);
 
       final long requestStartTime = System.currentTimeMillis();
 
@@ -178,7 +179,7 @@ public class DirectDruidClient<T> implements QueryRunner<T>
         @Override
         public ClientResponse<InputStream> handleResponse(HttpResponse response)
         {
-          log.debug("Initial response from url[%s]", url);
+          log.debug("Initial response from url[%s] for queryId[%s]", url, query.getId());
           responseStartTime = System.currentTimeMillis();
           emitter.emit(builder.build("query/node/ttfb", responseStartTime - requestStartTime));
 
@@ -271,13 +272,15 @@ public class DirectDruidClient<T> implements QueryRunner<T>
         {
           long stopTime = System.currentTimeMillis();
           log.debug(
-              "Completed request to url[%s] with %,d bytes returned in %,d millis [%,f b/s].",
+              "Completed queryId[%s] request to url[%s] with %,d bytes returned in %,d millis [%,f b/s].",
+              query.getId(),
               url,
               byteCount.get(),
               stopTime - responseStartTime,
               byteCount.get() / (0.0001 * (stopTime - responseStartTime))
           );
           emitter.emit(builder.build("query/node/time", stopTime - requestStartTime));
+          emitter.emit(builder.build("query/node/bytes", byteCount.get()));
           synchronized (done) {
             try {
               // An empty byte array is put at the end to give the SequenceInputStream.close() as something to close out
@@ -476,8 +479,14 @@ public class DirectDruidClient<T> implements QueryRunner<T>
           jp = objectMapper.getFactory().createParser(future.get());
           final JsonToken nextToken = jp.nextToken();
           if (nextToken == JsonToken.START_OBJECT) {
-            QueryInterruptedException e = jp.getCodec().readValue(jp, QueryInterruptedException.class);
-            throw e;
+            QueryInterruptedException cause = jp.getCodec().readValue(jp, QueryInterruptedException.class);
+            //case we get an exception with an unknown message.
+            if (cause.isNotKnown()) {
+              throw new QueryInterruptedException(QueryInterruptedException.UNKNOWN_EXCEPTION, cause.getMessage(), host);
+            } else {
+              throw  new QueryInterruptedException(cause, host);
+            }
+
           } else if (nextToken != JsonToken.START_ARRAY) {
             throw new IAE("Next token wasn't a START_ARRAY, was[%s] from url [%s]", jp.getCurrentToken(), url);
           } else {
@@ -489,7 +498,7 @@ public class DirectDruidClient<T> implements QueryRunner<T>
           throw new RE(e, "Failure getting results from[%s] because of [%s]", url, e.getMessage());
         }
         catch (CancellationException e) {
-          throw new QueryInterruptedException("Query cancelled");
+          throw new QueryInterruptedException(e, host);
         }
       }
     }

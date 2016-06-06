@@ -61,6 +61,7 @@ import io.druid.data.input.MapBasedRow;
 import io.druid.data.input.Row;
 import io.druid.granularity.PeriodGranularity;
 import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.jackson.DefaultObjectMapper;
 import io.druid.query.BySegmentResultValueClass;
 import io.druid.query.DataSource;
@@ -206,7 +207,7 @@ public class CachingClusteredClientTest
   );
   private static final DimFilter DIM_FILTER = null;
   private static final List<PostAggregator> RENAMED_POST_AGGS = ImmutableList.of();
-  private static final QueryGranularity GRANULARITY = QueryGranularity.DAY;
+  private static final QueryGranularity GRANULARITY = QueryGranularities.DAY;
   private static final DateTimeZone TIMEZONE = DateTimeZone.forID("America/Los_Angeles");
   private static final QueryGranularity PT1H_TZ_GRANULARITY = new PeriodGranularity(new Period("PT1H"), null, TIMEZONE);
   private static final String TOP_DIM = "a_dim";
@@ -926,11 +927,15 @@ public class CachingClusteredClientTest
             new DateTime("2011-01-09T01"), "a", 50, 4985, "b", 50, 4984, "c", 50, 4983
         ),
         client.mergeCachedAndUncachedSequences(
-            sequences,
-            new TopNQueryQueryToolChest(
-                new TopNQueryConfig(),
-                QueryRunnerTestHelper.NoopIntervalChunkingQueryRunnerDecorator()
-            )
+            new TopNQueryBuilder()
+                .dataSource("test")
+                .intervals("2011-01-06/2011-01-10")
+                .dimension("a")
+                .metric("b")
+                .threshold(3)
+                .aggregators(Arrays.<AggregatorFactory>asList(new CountAggregatorFactory("b")))
+                .build(),
+            sequences
         )
     );
   }

@@ -64,22 +64,19 @@ public class ChainedExecutionQueryRunner<T> implements QueryRunner<T>
 
   private final Iterable<QueryRunner<T>> queryables;
   private final ListeningExecutorService exec;
-  private final Ordering<T> ordering;
   private final QueryWatcher queryWatcher;
 
   public ChainedExecutionQueryRunner(
       ExecutorService exec,
-      Ordering<T> ordering,
       QueryWatcher queryWatcher,
       QueryRunner<T>... queryables
   )
   {
-    this(exec, ordering, queryWatcher, Arrays.asList(queryables));
+    this(exec, queryWatcher, Arrays.asList(queryables));
   }
 
   public ChainedExecutionQueryRunner(
       ExecutorService exec,
-      Ordering<T> ordering,
       QueryWatcher queryWatcher,
       Iterable<QueryRunner<T>> queryables
   )
@@ -87,7 +84,6 @@ public class ChainedExecutionQueryRunner<T> implements QueryRunner<T>
     // listeningDecorator will leave PrioritizedExecutorService unchanged,
     // since it already implements ListeningExecutorService
     this.exec = MoreExecutors.listeningDecorator(exec);
-    this.ordering = ordering;
     this.queryables = Iterables.unmodifiableIterable(queryables);
     this.queryWatcher = queryWatcher;
   }
@@ -95,7 +91,8 @@ public class ChainedExecutionQueryRunner<T> implements QueryRunner<T>
   @Override
   public Sequence<T> run(final Query<T> query, final Map<String, Object> responseContext)
   {
-    final int priority = query.getContextPriority(0);
+    final int priority = BaseQuery.getContextPriority(query, 0);
+    final Ordering ordering = query.getResultOrdering();
 
     return new BaseSequence<T, Iterator<T>>(
         new BaseSequence.IteratorMaker<T, Iterator<T>>()
@@ -166,15 +163,15 @@ public class ChainedExecutionQueryRunner<T> implements QueryRunner<T>
             catch (InterruptedException e) {
               log.warn(e, "Query interrupted, cancelling pending results, query id [%s]", query.getId());
               futures.cancel(true);
-              throw new QueryInterruptedException("Query interrupted");
+              throw new QueryInterruptedException(e);
             }
             catch (CancellationException e) {
-              throw new QueryInterruptedException("Query cancelled");
+              throw new QueryInterruptedException(e);
             }
             catch (TimeoutException e) {
               log.info("Query timeout, cancelling pending results for query id [%s]", query.getId());
               futures.cancel(true);
-              throw new QueryInterruptedException("Query timeout");
+              throw new QueryInterruptedException(e);
             }
             catch (ExecutionException e) {
               throw Throwables.propagate(e.getCause());

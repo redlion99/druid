@@ -35,13 +35,13 @@ public class ExtractionDimFilterTest
     ExtractionDimFilter extractionDimFilter = new ExtractionDimFilter(
         "abc",
         "d",
-        new IdentityExtractionFn(),
+        IdentityExtractionFn.getInstance(),
         null
     );
     ExtractionDimFilter extractionDimFilter2 = new ExtractionDimFilter(
         "ab",
         "cd",
-        new IdentityExtractionFn(),
+        IdentityExtractionFn.getInstance(),
         null
     );
 
@@ -55,5 +55,7 @@ public class ExtractionDimFilterTest
     );
 
     Assert.assertFalse(Arrays.equals(extractionDimFilter2.getCacheKey(), extractionDimFilter3.getCacheKey()));
+
+    Assert.assertNotNull(new ExtractionDimFilter("foo", null, new RegexDimExtractionFn("xx", null, null), null).getCacheKey());
   }
 }

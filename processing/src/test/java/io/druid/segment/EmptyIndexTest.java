@@ -22,7 +22,7 @@ package io.druid.segment;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.metamx.collections.bitmap.ConciseBitmapFactory;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.query.aggregation.AggregatorFactory;
 import io.druid.segment.column.Column;
 import io.druid.segment.incremental.IncrementalIndex;
@@ -50,7 +50,7 @@ public class EmptyIndexTest
 
     IncrementalIndex emptyIndex = new OnheapIncrementalIndex(
         0,
-        QueryGranularity.NONE,
+        QueryGranularities.NONE,
         new AggregatorFactory[0],
         1000
     );
@@ -63,7 +63,6 @@ public class EmptyIndexTest
         Lists.<IndexableAdapter>newArrayList(emptyIndexAdapter),
         new AggregatorFactory[0],
         tmpDir,
-        null,
         new IndexSpec()
     );
 

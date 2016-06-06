@@ -22,6 +22,7 @@ package io.druid.query.extraction;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.metamx.common.StringUtils;
 
 import java.nio.ByteBuffer;
@@ -32,8 +33,6 @@ import java.util.regex.Pattern;
  */
 public class MatchingDimExtractionFn extends DimExtractionFn
 {
-  private static final byte CACHE_TYPE_ID = 0x2;
-
   private final String expr;
   private final Pattern pattern;
 
@@ -53,7 +52,7 @@ public class MatchingDimExtractionFn extends DimExtractionFn
   {
     byte[] exprBytes = StringUtils.toUtf8(expr);
     return ByteBuffer.allocate(1 + exprBytes.length)
-                     .put(CACHE_TYPE_ID)
+                     .put(ExtractionCacheHelper.CACHE_TYPE_ID_MATCHING_DIM)
                      .put(exprBytes)
                      .array();
   }
@@ -61,7 +60,11 @@ public class MatchingDimExtractionFn extends DimExtractionFn
   @Override
   public String apply(String dimValue)
   {
-    dimValue = (dimValue == null) ? "" : dimValue;
+    if (Strings.isNullOrEmpty(dimValue)) {
+      // We'd return null whether or not the pattern matched
+      return null;
+    }
+
     Matcher matcher = pattern.matcher(dimValue);
     return matcher.find() ? dimValue : null;
   }

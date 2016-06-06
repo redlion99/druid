@@ -27,9 +27,11 @@ import com.metamx.common.ISE;
 import io.druid.guice.ServerModule;
 import io.druid.jackson.DefaultObjectMapper;
 import io.druid.segment.IndexIO;
-import io.druid.segment.IndexMaker;
 import io.druid.segment.IndexMerger;
+import io.druid.segment.IndexMergerV9;
 import io.druid.segment.column.ColumnConfig;
+import io.druid.segment.realtime.firehose.ChatHandlerProvider;
+import io.druid.segment.realtime.firehose.NoopChatHandlerProvider;
 
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -40,7 +42,7 @@ public class TestUtils
 {
   private final ObjectMapper jsonMapper;
   private final IndexMerger indexMerger;
-  private final IndexMaker indexMaker;
+  private final IndexMergerV9 indexMergerV9;
   private final IndexIO indexIO;
 
   public TestUtils()
@@ -58,7 +60,7 @@ public class TestUtils
         }
     );
     indexMerger = new IndexMerger(jsonMapper, indexIO);
-    indexMaker = new IndexMaker(jsonMapper, indexIO);
+    indexMergerV9 = new IndexMergerV9(jsonMapper, indexIO);
 
     final List<? extends Module> list = new ServerModule().getJacksonModules();
     for (Module module : list) {
@@ -69,8 +71,8 @@ public class TestUtils
         new InjectableValues.Std()
             .addValue(IndexIO.class, indexIO)
             .addValue(IndexMerger.class, indexMerger)
-            .addValue(IndexMaker.class, indexMaker)
             .addValue(ObjectMapper.class, jsonMapper)
+            .addValue(ChatHandlerProvider.class, new NoopChatHandlerProvider())
     );
   }
 
@@ -84,9 +86,8 @@ public class TestUtils
     return indexMerger;
   }
 
-  public IndexMaker getTestIndexMaker()
-  {
-    return indexMaker;
+  public IndexMergerV9 getTestIndexMergerV9() {
+    return indexMergerV9;
   }
 
   public IndexIO getTestIndexIO()
@@ -96,12 +97,17 @@ public class TestUtils
 
   public static boolean conditionValid(IndexingServiceCondition condition)
   {
+    return conditionValid(condition, 1000);
+  }
+
+  public static boolean conditionValid(IndexingServiceCondition condition, long timeout)
+  {
     try {
       Stopwatch stopwatch = Stopwatch.createUnstarted();
       stopwatch.start();
       while (!condition.isValid()) {
         Thread.sleep(100);
-        if (stopwatch.elapsed(TimeUnit.MILLISECONDS) > 1000) {
+        if (stopwatch.elapsed(TimeUnit.MILLISECONDS) > timeout) {
           throw new ISE("Cannot find running task");
         }
       }

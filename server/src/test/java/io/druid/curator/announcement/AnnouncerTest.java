@@ -172,6 +172,10 @@ public class AnnouncerTest extends CuratorTestBase
 
       announcer.stop();
 
+      while ((curator.checkExists().forPath(testPath1) != null) || (curator.checkExists().forPath(testPath2) != null)) {
+        Thread.sleep(100);
+      }
+
       Assert.assertNull(curator.checkExists().forPath(testPath1));
       Assert.assertNull(curator.checkExists().forPath(testPath2));
     }
@@ -184,6 +188,7 @@ public class AnnouncerTest extends CuratorTestBase
   public void testCleansUpItsLittleTurdlings() throws Exception
   {
     curator.start();
+    curator.blockUntilConnected();
     Announcer announcer = new Announcer(curator, exec);
 
     final byte[] billy = "billy".getBytes();
@@ -209,6 +214,7 @@ public class AnnouncerTest extends CuratorTestBase
   public void testLeavesBehindTurdlingsThatAlreadyExisted() throws Exception
   {
     curator.start();
+    curator.blockUntilConnected();
     Announcer announcer = new Announcer(curator, exec);
 
     final byte[] billy = "billy".getBytes();
@@ -237,6 +243,7 @@ public class AnnouncerTest extends CuratorTestBase
   public void testLeavesBehindTurdlingsWhenToldTo() throws Exception
   {
     curator.start();
+    curator.blockUntilConnected();
     Announcer announcer = new Announcer(curator, exec);
 
     final byte[] billy = "billy".getBytes();

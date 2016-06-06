@@ -50,8 +50,8 @@ import io.druid.indexer.partitions.PartitionsSpec;
 import io.druid.indexer.path.PathSpec;
 import io.druid.initialization.Initialization;
 import io.druid.segment.IndexIO;
-import io.druid.segment.IndexMaker;
 import io.druid.segment.IndexMerger;
+import io.druid.segment.IndexMergerV9;
 import io.druid.segment.IndexSpec;
 import io.druid.segment.indexing.granularity.GranularitySpec;
 import io.druid.server.DruidNode;
@@ -90,7 +90,7 @@ public class HadoopDruidIndexerConfig
   public static final ObjectMapper JSON_MAPPER;
   public static final IndexIO INDEX_IO;
   public static final IndexMerger INDEX_MERGER;
-  public static final IndexMaker INDEX_MAKER;
+  public static final IndexMergerV9 INDEX_MERGER_V9;
 
   private static final String DEFAULT_WORKING_PATH = "/tmp/druid-indexing";
 
@@ -114,7 +114,7 @@ public class HadoopDruidIndexerConfig
     JSON_MAPPER = injector.getInstance(ObjectMapper.class);
     INDEX_IO = injector.getInstance(IndexIO.class);
     INDEX_MERGER = injector.getInstance(IndexMerger.class);
-    INDEX_MAKER = injector.getInstance(IndexMaker.class);
+    INDEX_MERGER_V9 = injector.getInstance(IndexMergerV9.class);
   }
 
   public static enum IndexJobCounters
@@ -212,8 +212,8 @@ public class HadoopDruidIndexerConfig
 
   private volatile HadoopIngestionSpec schema;
   private volatile PathSpec pathSpec;
-  private volatile Map<DateTime, ShardSpecLookup> shardSpecLookups = Maps.newHashMap();
-  private volatile Map<ShardSpec, HadoopyShardSpec> hadoopShardSpecLookup = Maps.newHashMap();
+  private final Map<DateTime, ShardSpecLookup> shardSpecLookups = Maps.newHashMap();
+  private final Map<DateTime, Map<ShardSpec, HadoopyShardSpec>> hadoopShardSpecLookup = Maps.newHashMap();
   private final QueryGranularity rollupGran;
 
   @JsonCreator
@@ -242,9 +242,13 @@ public class HadoopDruidIndexerConfig
               )
           )
       );
+
+      Map<ShardSpec, HadoopyShardSpec> innerHadoopShardSpecLookup = Maps.newHashMap();
       for (HadoopyShardSpec hadoopyShardSpec : entry.getValue()) {
-        hadoopShardSpecLookup.put(hadoopyShardSpec.getActualSpec(), hadoopyShardSpec);
+        innerHadoopShardSpecLookup.put(hadoopyShardSpec.getActualSpec(), hadoopyShardSpec);
       }
+      hadoopShardSpecLookup.put(entry.getKey(), innerHadoopShardSpecLookup);
+
     }
     this.rollupGran = spec.getDataSchema().getGranularitySpec().getQueryGranularity();
   }
@@ -354,6 +358,11 @@ public class HadoopDruidIndexerConfig
     return schema.getTuningConfig().getShardSpecs().get(bucket.time).get(bucket.partitionNum);
   }
 
+  public boolean isBuildV9Directly()
+  {
+    return schema.getTuningConfig().getBuildV9Directly();
+  }
+
   /**
    * Job instance should have Configuration set (by calling {@link #addJobProperties(Job)}
    * or via injected system properties) before this method is called.  The {@link PathSpec} may
@@ -388,18 +397,18 @@ public class HadoopDruidIndexerConfig
     if (!timeBucket.isPresent()) {
       return Optional.absent();
     }
-
-    final ShardSpec actualSpec = shardSpecLookups.get(timeBucket.get().getStart())
+    final DateTime bucketStart = timeBucket.get().getStart();
+    final ShardSpec actualSpec = shardSpecLookups.get(bucketStart)
                                                  .getShardSpec(
                                                      rollupGran.truncate(inputRow.getTimestampFromEpoch()),
                                                      inputRow
                                                  );
-    final HadoopyShardSpec hadoopyShardSpec = hadoopShardSpecLookup.get(actualSpec);
+    final HadoopyShardSpec hadoopyShardSpec = hadoopShardSpecLookup.get(bucketStart).get(actualSpec);
 
     return Optional.of(
         new Bucket(
             hadoopyShardSpec.getShardNum(),
-            timeBucket.get().getStart(),
+            bucketStart,
             actualSpec.getPartitionNum()
         )
     );

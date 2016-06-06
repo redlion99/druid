@@ -123,7 +123,12 @@ public class IndexTask extends AbstractFixedIntervalTask
     );
   }
 
-  static RealtimeTuningConfig convertTuningConfig(ShardSpec shardSpec, int rowFlushBoundary, IndexSpec indexSpec)
+  static RealtimeTuningConfig convertTuningConfig(
+      ShardSpec shardSpec,
+      int rowFlushBoundary,
+      IndexSpec indexSpec,
+      boolean buildV9Directly
+  )
   {
     return new RealtimeTuningConfig(
         rowFlushBoundary,
@@ -134,7 +139,12 @@ public class IndexTask extends AbstractFixedIntervalTask
         null,
         null,
         shardSpec,
-        indexSpec
+        indexSpec,
+        buildV9Directly,
+        0,
+        0,
+        true,
+        null
     );
   }
 
@@ -201,7 +211,7 @@ public class IndexTask extends AbstractFixedIntervalTask
         if (numShards > 0) {
           shardSpecs = Lists.newArrayList();
           for (int i = 0; i < numShards; i++) {
-            shardSpecs.add(new HashBasedNumberedShardSpec(i, numShards, jsonMapper));
+            shardSpecs.add(new HashBasedNumberedShardSpec(i, numShards, null, jsonMapper));
           }
         } else {
           shardSpecs = ImmutableList.<ShardSpec>of(new NoneShardSpec());
@@ -218,7 +228,7 @@ public class IndexTask extends AbstractFixedIntervalTask
         segments.add(segment);
       }
     }
-    toolbox.pushSegments(segments);
+    toolbox.publishSegments(segments);
     return TaskStatus.success(getId());
   }
 
@@ -294,7 +304,7 @@ public class IndexTask extends AbstractFixedIntervalTask
       shardSpecs.add(new NoneShardSpec());
     } else {
       for (int i = 0; i < numberOfShards; ++i) {
-        shardSpecs.add(new HashBasedNumberedShardSpec(i, numberOfShards, jsonMapper));
+        shardSpecs.add(new HashBasedNumberedShardSpec(i, numberOfShards, null, jsonMapper));
       }
     }
 
@@ -359,10 +369,16 @@ public class IndexTask extends AbstractFixedIntervalTask
         wrappedDataSegmentPusher,
         tmpDir,
         toolbox.getIndexMerger(),
+        toolbox.getIndexMergerV9(),
         toolbox.getIndexIO()
     ).findPlumber(
         schema,
-        convertTuningConfig(shardSpec, myRowFlushBoundary, ingestionSchema.getTuningConfig().getIndexSpec()),
+        convertTuningConfig(
+            shardSpec,
+            myRowFlushBoundary,
+            ingestionSchema.getTuningConfig().getIndexSpec(),
+            ingestionSchema.tuningConfig.getBuildV9Directly()
+        ),
         metrics
     );
 
@@ -434,7 +450,7 @@ public class IndexTask extends AbstractFixedIntervalTask
 
       this.dataSchema = dataSchema;
       this.ioConfig = ioConfig;
-      this.tuningConfig = tuningConfig == null ? new IndexTuningConfig(0, 0, null, null) : tuningConfig;
+      this.tuningConfig = tuningConfig == null ? new IndexTuningConfig(0, 0, null, null, null) : tuningConfig;
     }
 
     @Override
@@ -483,20 +499,23 @@ public class IndexTask extends AbstractFixedIntervalTask
   public static class IndexTuningConfig implements TuningConfig
   {
     private static final int DEFAULT_TARGET_PARTITION_SIZE = 5000000;
-    private static final int DEFAULT_ROW_FLUSH_BOUNDARY = 500000;
+    private static final int DEFAULT_ROW_FLUSH_BOUNDARY = 75000;
     private static final IndexSpec DEFAULT_INDEX_SPEC = new IndexSpec();
+    private static final Boolean DEFAULT_BUILD_V9_DIRECTLY = Boolean.FALSE;
 
     private final int targetPartitionSize;
     private final int rowFlushBoundary;
     private final int numShards;
     private final IndexSpec indexSpec;
+    private final Boolean buildV9Directly;
 
     @JsonCreator
     public IndexTuningConfig(
         @JsonProperty("targetPartitionSize") int targetPartitionSize,
         @JsonProperty("rowFlushBoundary") int rowFlushBoundary,
         @JsonProperty("numShards") @Nullable Integer numShards,
-        @JsonProperty("indexSpec") @Nullable IndexSpec indexSpec
+        @JsonProperty("indexSpec") @Nullable IndexSpec indexSpec,
+        @JsonProperty("buildV9Directly") Boolean buildV9Directly
     )
     {
       this.targetPartitionSize = targetPartitionSize == 0 ? DEFAULT_TARGET_PARTITION_SIZE : targetPartitionSize;
@@ -508,6 +527,7 @@ public class IndexTask extends AbstractFixedIntervalTask
           this.targetPartitionSize == -1 || this.numShards == -1,
           "targetPartitionsSize and shardCount both cannot be set"
       );
+      this.buildV9Directly = buildV9Directly == null ? DEFAULT_BUILD_V9_DIRECTLY : buildV9Directly;
     }
 
     @JsonProperty
@@ -532,6 +552,12 @@ public class IndexTask extends AbstractFixedIntervalTask
     public IndexSpec getIndexSpec()
     {
       return indexSpec;
+    }
+
+    @JsonProperty
+    public Boolean getBuildV9Directly()
+    {
+      return buildV9Directly;
     }
   }
 }

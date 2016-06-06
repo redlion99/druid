@@ -21,7 +21,6 @@ package io.druid.server.coordinator;
 
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.metamx.common.guava.Comparators;
 import com.metamx.emitter.service.ServiceEmitter;
 import io.druid.client.DruidDataSource;
 import io.druid.metadata.MetadataRuleManager;
@@ -199,14 +198,13 @@ public class DruidCoordinatorRuntimeParams
       this.databaseRuleManager = null;
       this.segmentReplicantLookup = null;
       this.dataSources = Sets.newHashSet();
-      this.availableSegments = Sets.newTreeSet(Comparators.inverse(DataSegment.bucketMonthComparator()));
+      this.availableSegments = Sets.newTreeSet(DruidCoordinator.SEGMENT_COMPARATOR);
       this.loadManagementPeons = Maps.newHashMap();
       this.replicationManager = null;
       this.emitter = null;
       this.stats = new CoordinatorStats();
       this.coordinatorDynamicConfig = new CoordinatorDynamicConfig.Builder().build();
       this.balancerReferenceTimestamp = DateTime.now();
-      this.strategyFactory = new CostBalancerStrategyFactory(1);
     }
 
     Builder(

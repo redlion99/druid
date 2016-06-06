@@ -29,6 +29,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Splitter;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -45,13 +46,16 @@ import com.google.inject.Inject;
 import com.metamx.common.ISE;
 import com.metamx.common.Pair;
 import com.metamx.common.lifecycle.LifecycleStop;
+import com.metamx.common.logger.Logger;
 import com.metamx.emitter.EmittingLogger;
 import io.druid.concurrent.Execs;
 import io.druid.guice.annotations.Self;
+import io.druid.indexing.common.TaskLocation;
 import io.druid.indexing.common.TaskStatus;
 import io.druid.indexing.common.config.TaskConfig;
 import io.druid.indexing.common.task.Task;
 import io.druid.indexing.common.tasklogs.LogUtils;
+import io.druid.indexing.overlord.autoscaling.ScalingStats;
 import io.druid.indexing.overlord.config.ForkingTaskRunnerConfig;
 import io.druid.indexing.worker.config.WorkerConfig;
 import io.druid.query.DruidMetrics;
@@ -72,9 +76,11 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -93,8 +99,10 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
   private final ListeningExecutorService exec;
   private final ObjectMapper jsonMapper;
   private final PortFinder portFinder;
+  private final CopyOnWriteArrayList<Pair<TaskRunnerListener, Executor>> listeners = new CopyOnWriteArrayList<>();
 
-  private final Map<String, ForkingTaskRunnerWorkItem> tasks = Maps.newHashMap();
+  // Writes must be synchronized. This is only a ConcurrentMap so "informational" reads can occur without waiting.
+  private final Map<String, ForkingTaskRunnerWorkItem> tasks = Maps.newConcurrentMap();
 
   private volatile boolean stopping = false;
 
@@ -149,7 +157,7 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
           throw new ISE("WTF?! Task[%s] restore file had wrong id[%s].", taskId, task.getId());
         }
 
-        if (task.canRestore()) {
+        if (taskConfig.isRestoreTasksOnRestart() && task.canRestore()) {
           log.info("Restoring task[%s].", task.getId());
           retVal.add(Pair.of(task, run(task)));
         }
@@ -162,6 +170,39 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
     log.info("Restored %,d tasks.", retVal.size());
 
     return retVal;
+  }
+
+  @Override
+  public void registerListener(TaskRunnerListener listener, Executor executor)
+  {
+    for (Pair<TaskRunnerListener, Executor> pair : listeners) {
+      if (pair.lhs.getListenerId().equals(listener.getListenerId())) {
+        throw new ISE("Listener [%s] already registered", listener.getListenerId());
+      }
+    }
+
+    final Pair<TaskRunnerListener, Executor> listenerPair = Pair.of(listener, executor);
+
+    synchronized (tasks) {
+      for (ForkingTaskRunnerWorkItem item : tasks.values()) {
+        TaskRunnerUtils.notifyLocationChanged(ImmutableList.of(listenerPair), item.getTaskId(), item.getLocation());
+      }
+
+      listeners.add(listenerPair);
+      log.info("Registered listener [%s]", listener.getListenerId());
+    }
+  }
+
+  @Override
+  public void unregisterListener(String listenerId)
+  {
+    for (Pair<TaskRunnerListener, Executor> pair : listeners) {
+      if (pair.lhs.getListenerId().equals(listenerId)) {
+        listeners.remove(pair);
+        log.info("Unregistered listener [%s]", listenerId);
+        return;
+      }
+    }
   }
 
   @Override
@@ -184,6 +225,7 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                         final File attemptDir = new File(taskDir, attemptUUID);
 
                         final ProcessHolder processHolder;
+                        final String childHost = node.getHost();
                         final int childPort;
                         final int childChatHandlerPort;
 
@@ -195,6 +237,8 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                           childPort = portFinder.findUnusedPort();
                           childChatHandlerPort = -1;
                         }
+
+                        final TaskLocation taskLocation = TaskLocation.create(childHost, childPort);
 
                         try {
                           final Closer closer = Closer.create();
@@ -228,7 +272,6 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                               }
 
                               final List<String> command = Lists.newArrayList();
-                              final String childHost = node.getHost();
                               final String taskClasspath;
                               if (task.getClasspathPrefix() != null && !task.getClasspathPrefix().isEmpty()) {
                                 taskClasspath = Joiner.on(File.pathSeparator).join(
@@ -244,6 +287,7 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                               command.add(taskClasspath);
 
                               Iterables.addAll(command, new QuotableWhiteSpaceSplitter(config.getJavaOpts()));
+                              Iterables.addAll(command, config.getJavaOptsArray());
 
                               // Override task specific javaOpts
                               Object taskJavaOpts = task.getContextValue(
@@ -260,7 +304,9 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                                 for (String allowedPrefix : config.getAllowedPrefixes()) {
                                   // See https://github.com/druid-io/druid/issues/1841
                                   if (propName.startsWith(allowedPrefix)
-                                      && !ForkingTaskRunnerConfig.JAVA_OPTS_PROPERTY.equals(propName)) {
+                                      && !ForkingTaskRunnerConfig.JAVA_OPTS_PROPERTY.equals(propName)
+                                      && !ForkingTaskRunnerConfig.JAVA_OPTS_ARRAY_PROPERTY.equals(propName)
+                                      ) {
                                     command.add(
                                         String.format(
                                             "-D%s=%s",
@@ -301,7 +347,7 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                                 }
                               }
 
-                              // Add dataSource and taskId for metrics
+                              // Add dataSource and taskId for metrics or logging
                               command.add(
                                   String.format(
                                       "-D%s%s=%s",
@@ -321,6 +367,14 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
 
                               command.add(String.format("-Ddruid.host=%s", childHost));
                               command.add(String.format("-Ddruid.port=%d", childPort));
+                              /**
+                               * These are not enabled per default to allow the user to either set or not set them
+                               * Users are highly suggested to be set in druid.indexer.runner.javaOpts
+                               * See io.druid.concurrent.TaskThreadPriority#getThreadPriorityFromTaskPriority(int)
+                               * for more information
+                               command.add("-XX:+UseThreadPriorities");
+                               command.add("-XX:ThreadPriorityPolicy=42");
+                               */
 
                               if (config.isSeparateIngestionEndpoint()) {
                                 command.add(String.format(
@@ -355,12 +409,20 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                               taskWorkItem.processHolder = new ProcessHolder(
                                   new ProcessBuilder(ImmutableList.copyOf(command)).redirectErrorStream(true).start(),
                                   logFile,
-                                  childPort
+                                  taskLocation.getHost(),
+                                  taskLocation.getPort()
                               );
 
                               processHolder = taskWorkItem.processHolder;
                               processHolder.registerWithCloser(closer);
                             }
+
+                            TaskRunnerUtils.notifyLocationChanged(listeners, task.getId(), taskLocation);
+                            TaskRunnerUtils.notifyStatusChanged(
+                                listeners,
+                                task.getId(),
+                                TaskStatus.running(task.getId())
+                            );
 
                             log.info("Logging task %s output to: %s", task.getId(), logFile);
                             boolean runFailed = true;
@@ -379,13 +441,17 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                               taskLogPusher.pushTaskLog(task.getId(), logFile);
                             }
 
+                            TaskStatus status;
                             if (!runFailed) {
                               // Process exited successfully
-                              return jsonMapper.readValue(statusFile, TaskStatus.class);
+                              status = jsonMapper.readValue(statusFile, TaskStatus.class);
                             } else {
                               // Process exited unsuccessfully
-                              return TaskStatus.failure(task.getId());
+                              status = TaskStatus.failure(task.getId());
                             }
+
+                            TaskRunnerUtils.notifyStatusChanged(listeners, task.getId(), status);
+                            return status;
                           }
                           catch (Throwable t) {
                             throw closer.rethrow(t);
@@ -410,6 +476,7 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
                               }
                             }
 
+                            portFinder.markPortUnused(childPort);
                             if (childChatHandlerPort > 0) {
                               portFinder.markPortUnused(childChatHandlerPort);
                             }
@@ -467,11 +534,27 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
     final long timeout = new Interval(start, taskConfig.getGracefulShutdownTimeout()).toDurationMillis();
 
     // Things should be terminating now. Wait for it to happen so logs can be uploaded and all that good stuff.
-    log.info("Waiting %,dms for shutdown.", timeout);
+    log.info("Waiting up to %,dms for shutdown.", timeout);
     if (timeout > 0) {
       try {
-        exec.awaitTermination(timeout, TimeUnit.MILLISECONDS);
-        log.info("Finished stopping in %,dms.", System.currentTimeMillis() - start.getMillis());
+        final boolean terminated = exec.awaitTermination(timeout, TimeUnit.MILLISECONDS);
+        final long elapsed = System.currentTimeMillis() - start.getMillis();
+        if (terminated) {
+          log.info("Finished stopping in %,dms.", elapsed);
+        } else {
+          final Set<String> stillRunning = ImmutableSet.copyOf(tasks.keySet());
+
+          log.makeAlert("Failed to stop forked tasks")
+             .addData("stillRunning", stillRunning)
+             .addData("elapsed", elapsed)
+             .emit();
+
+          log.warn(
+              "Executor failed to stop after %,dms, not waiting for it! Tasks still running: [%s]",
+              elapsed,
+              Joiner.on("; ").join(stillRunning)
+          );
+        }
       }
       catch (InterruptedException e) {
         log.warn(e, "Interrupted while waiting for executor to finish.");
@@ -542,9 +625,15 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
   }
 
   @Override
-  public Collection<ZkWorker> getWorkers()
+  public Optional<ScalingStats> getScalingStats()
   {
-    return ImmutableList.of();
+    return Optional.absent();
+  }
+
+  @Override
+  public void start()
+  {
+    // No state setup required
   }
 
   @Override
@@ -636,18 +725,30 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
     {
       return task;
     }
+
+    @Override
+    public TaskLocation getLocation()
+    {
+      if (processHolder == null) {
+        return TaskLocation.unknown();
+      } else {
+        return TaskLocation.create(processHolder.host, processHolder.port);
+      }
+    }
   }
 
   private static class ProcessHolder
   {
     private final Process process;
     private final File logFile;
+    private final String host;
     private final int port;
 
-    private ProcessHolder(Process process, File logFile, int port)
+    private ProcessHolder(Process process, File logFile, String host, int port)
     {
       this.process = process;
       this.logFile = logFile;
+      this.host = host;
       this.port = port;
     }
 
@@ -664,6 +765,7 @@ public class ForkingTaskRunner implements TaskRunner, TaskLogStreamer
  */
 class QuotableWhiteSpaceSplitter implements Iterable<String>
 {
+  private static final Logger LOG = new Logger(QuotableWhiteSpaceSplitter.class);
   private final String string;
 
   public QuotableWhiteSpaceSplitter(String string)

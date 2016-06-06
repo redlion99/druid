@@ -21,8 +21,10 @@ package io.druid.segment.indexing;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.common.base.Preconditions;
 import com.google.common.io.Files;
 import io.druid.segment.IndexSpec;
+import io.druid.segment.realtime.appenderator.AppenderatorConfig;
 import io.druid.segment.realtime.plumber.IntervalStartVersioningPolicy;
 import io.druid.segment.realtime.plumber.RejectionPolicyFactory;
 import io.druid.segment.realtime.plumber.ServerTimeRejectionPolicyFactory;
@@ -35,31 +37,43 @@ import java.io.File;
 
 /**
  */
-public class RealtimeTuningConfig implements TuningConfig
+public class RealtimeTuningConfig implements TuningConfig, AppenderatorConfig
 {
-  private static final int defaultMaxRowsInMemory = 500000;
+  private static final int defaultMaxRowsInMemory = 75000;
   private static final Period defaultIntermediatePersistPeriod = new Period("PT10M");
   private static final Period defaultWindowPeriod = new Period("PT10M");
-  private static final File defaultBasePersistDirectory = Files.createTempDir();
   private static final VersioningPolicy defaultVersioningPolicy = new IntervalStartVersioningPolicy();
   private static final RejectionPolicyFactory defaultRejectionPolicyFactory = new ServerTimeRejectionPolicyFactory();
   private static final int defaultMaxPendingPersists = 0;
   private static final ShardSpec defaultShardSpec = new NoneShardSpec();
   private static final IndexSpec defaultIndexSpec = new IndexSpec();
+  private static final Boolean defaultBuildV9Directly = Boolean.FALSE;
+  private static final Boolean defaultReportParseExceptions = Boolean.FALSE;
+  private static final long defaultHandoffConditionTimeout = 0;
+
+  private static File createNewBasePersistDirectory()
+  {
+    return Files.createTempDir();
+  }
 
   // Might make sense for this to be a builder
-  public static RealtimeTuningConfig makeDefaultTuningConfig()
+  public static RealtimeTuningConfig makeDefaultTuningConfig(final File basePersistDirectory)
   {
     return new RealtimeTuningConfig(
         defaultMaxRowsInMemory,
         defaultIntermediatePersistPeriod,
         defaultWindowPeriod,
-        defaultBasePersistDirectory,
+        basePersistDirectory == null ? createNewBasePersistDirectory() : basePersistDirectory,
         defaultVersioningPolicy,
         defaultRejectionPolicyFactory,
         defaultMaxPendingPersists,
         defaultShardSpec,
-        defaultIndexSpec
+        defaultIndexSpec,
+        defaultBuildV9Directly,
+        0,
+        0,
+        defaultReportParseExceptions,
+        defaultHandoffConditionTimeout
     );
   }
 
@@ -72,6 +86,11 @@ public class RealtimeTuningConfig implements TuningConfig
   private final int maxPendingPersists;
   private final ShardSpec shardSpec;
   private final IndexSpec indexSpec;
+  private final boolean buildV9Directly;
+  private final int persistThreadPriority;
+  private final int mergeThreadPriority;
+  private final boolean reportParseExceptions;
+  private final long handoffConditionTimeout;
 
   @JsonCreator
   public RealtimeTuningConfig(
@@ -83,7 +102,12 @@ public class RealtimeTuningConfig implements TuningConfig
       @JsonProperty("rejectionPolicy") RejectionPolicyFactory rejectionPolicyFactory,
       @JsonProperty("maxPendingPersists") Integer maxPendingPersists,
       @JsonProperty("shardSpec") ShardSpec shardSpec,
-      @JsonProperty("indexSpec") IndexSpec indexSpec
+      @JsonProperty("indexSpec") IndexSpec indexSpec,
+      @JsonProperty("buildV9Directly") Boolean buildV9Directly,
+      @JsonProperty("persistThreadPriority") int persistThreadPriority,
+      @JsonProperty("mergeThreadPriority") int mergeThreadPriority,
+      @JsonProperty("reportParseExceptions") Boolean reportParseExceptions,
+      @JsonProperty("handoffConditionTimeout") Long handoffConditionTimeout
   )
   {
     this.maxRowsInMemory = maxRowsInMemory == null ? defaultMaxRowsInMemory : maxRowsInMemory;
@@ -91,7 +115,7 @@ public class RealtimeTuningConfig implements TuningConfig
                                      ? defaultIntermediatePersistPeriod
                                      : intermediatePersistPeriod;
     this.windowPeriod = windowPeriod == null ? defaultWindowPeriod : windowPeriod;
-    this.basePersistDirectory = basePersistDirectory == null ? defaultBasePersistDirectory : basePersistDirectory;
+    this.basePersistDirectory = basePersistDirectory == null ? createNewBasePersistDirectory() : basePersistDirectory;
     this.versioningPolicy = versioningPolicy == null ? defaultVersioningPolicy : versioningPolicy;
     this.rejectionPolicyFactory = rejectionPolicyFactory == null
                                   ? defaultRejectionPolicyFactory
@@ -99,6 +123,17 @@ public class RealtimeTuningConfig implements TuningConfig
     this.maxPendingPersists = maxPendingPersists == null ? defaultMaxPendingPersists : maxPendingPersists;
     this.shardSpec = shardSpec == null ? defaultShardSpec : shardSpec;
     this.indexSpec = indexSpec == null ? defaultIndexSpec : indexSpec;
+    this.buildV9Directly = buildV9Directly == null ? defaultBuildV9Directly : buildV9Directly;
+    this.mergeThreadPriority = mergeThreadPriority;
+    this.persistThreadPriority = persistThreadPriority;
+    this.reportParseExceptions = reportParseExceptions == null
+                                 ? defaultReportParseExceptions
+                                 : reportParseExceptions;
+
+    this.handoffConditionTimeout = handoffConditionTimeout == null
+                                   ? defaultHandoffConditionTimeout
+                                   : handoffConditionTimeout;
+    Preconditions.checkArgument(this.handoffConditionTimeout >= 0, "handoffConditionTimeout must be >= 0");
   }
 
   @JsonProperty
@@ -155,6 +190,36 @@ public class RealtimeTuningConfig implements TuningConfig
     return indexSpec;
   }
 
+  @JsonProperty
+  public Boolean getBuildV9Directly()
+  {
+    return buildV9Directly;
+  }
+
+  @JsonProperty
+  public int getPersistThreadPriority()
+  {
+    return this.persistThreadPriority;
+  }
+
+  @JsonProperty
+  public int getMergeThreadPriority()
+  {
+    return this.mergeThreadPriority;
+  }
+
+  @JsonProperty
+  public boolean isReportParseExceptions()
+  {
+    return reportParseExceptions;
+  }
+
+  @JsonProperty
+  public long getHandoffConditionTimeout()
+  {
+    return handoffConditionTimeout;
+  }
+
   public RealtimeTuningConfig withVersioningPolicy(VersioningPolicy policy)
   {
     return new RealtimeTuningConfig(
@@ -166,7 +231,12 @@ public class RealtimeTuningConfig implements TuningConfig
         rejectionPolicyFactory,
         maxPendingPersists,
         shardSpec,
-        indexSpec
+        indexSpec,
+        buildV9Directly,
+        persistThreadPriority,
+        mergeThreadPriority,
+        reportParseExceptions,
+        handoffConditionTimeout
     );
   }
 
@@ -181,7 +251,12 @@ public class RealtimeTuningConfig implements TuningConfig
         rejectionPolicyFactory,
         maxPendingPersists,
         shardSpec,
-        indexSpec
+        indexSpec,
+        buildV9Directly,
+        persistThreadPriority,
+        mergeThreadPriority,
+        reportParseExceptions,
+        handoffConditionTimeout
     );
   }
 }

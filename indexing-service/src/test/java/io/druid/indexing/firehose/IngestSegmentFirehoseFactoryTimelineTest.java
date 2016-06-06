@@ -40,7 +40,7 @@ import io.druid.data.input.impl.InputRowParser;
 import io.druid.data.input.impl.JSONParseSpec;
 import io.druid.data.input.impl.MapInputRowParser;
 import io.druid.data.input.impl.TimestampSpec;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.indexing.common.SegmentLoaderFactory;
 import io.druid.indexing.common.TaskToolboxFactory;
 import io.druid.indexing.common.TestUtils;
@@ -55,6 +55,7 @@ import io.druid.query.aggregation.LongSumAggregatorFactory;
 import io.druid.query.filter.NoopDimFilter;
 import io.druid.segment.IndexIO;
 import io.druid.segment.IndexMerger;
+import io.druid.segment.IndexMergerV9;
 import io.druid.segment.IndexSpec;
 import io.druid.segment.incremental.IncrementalIndexSchema;
 import io.druid.segment.incremental.IndexSizeExceededException;
@@ -96,7 +97,7 @@ public class IngestSegmentFirehoseFactoryTimelineTest
       new JSONParseSpec(
           new TimestampSpec(TIME_COLUMN, "auto", null),
           new DimensionsSpec(
-              Arrays.asList(DIMENSIONS),
+              DimensionsSpec.getDefaultSchemas(Arrays.asList(DIMENSIONS)),
               null,
               null
           )
@@ -111,12 +112,14 @@ public class IngestSegmentFirehoseFactoryTimelineTest
   private static final ObjectMapper MAPPER;
   private static final IndexMerger INDEX_MERGER;
   private static final IndexIO INDEX_IO;
+  private static final IndexMergerV9 INDEX_MERGER_V9;
 
   static {
     TestUtils testUtils = new TestUtils();
     MAPPER = IngestSegmentFirehoseFactoryTest.setupInjectablesInObjectMapper(testUtils.getTestObjectMapper());
     INDEX_MERGER = testUtils.getTestIndexMerger();
     INDEX_IO = testUtils.getTestIndexIO();
+    INDEX_MERGER_V9 = testUtils.getTestIndexMergerV9();
   }
 
   public IngestSegmentFirehoseFactoryTimelineTest(
@@ -206,7 +209,7 @@ public class IngestSegmentFirehoseFactoryTimelineTest
   {
     final File persistDir = new File(tmpDir, UUID.randomUUID().toString());
     final IncrementalIndexSchema schema = new IncrementalIndexSchema.Builder()
-        .withQueryGranularity(QueryGranularity.NONE)
+        .withQueryGranularity(QueryGranularities.NONE)
         .withMinTimestamp(JodaUtils.MIN_INSTANT)
         .withDimensionsSpec(ROW_PARSER)
         .withMetrics(
@@ -215,7 +218,7 @@ public class IngestSegmentFirehoseFactoryTimelineTest
             }
         )
         .build();
-    final OnheapIncrementalIndex index = new OnheapIncrementalIndex(schema, rows.length);
+    final OnheapIncrementalIndex index = new OnheapIncrementalIndex(schema, true, rows.length);
 
     for (InputRow row : rows) {
       try {
@@ -227,7 +230,7 @@ public class IngestSegmentFirehoseFactoryTimelineTest
     }
 
     try {
-      INDEX_MERGER.persist(index, persistDir, null, new IndexSpec());
+      INDEX_MERGER.persist(index, persistDir, new IndexSpec());
     }
     catch (IOException e) {
       throw Throwables.propagate(e);
@@ -298,7 +301,7 @@ public class IngestSegmentFirehoseFactoryTimelineTest
       SegmentHandoffNotifierFactory notifierFactory = EasyMock.createNiceMock(SegmentHandoffNotifierFactory.class);
       EasyMock.replay(notifierFactory);
       final TaskToolboxFactory taskToolboxFactory = new TaskToolboxFactory(
-          new TaskConfig(testCase.tmpDir.getAbsolutePath(), null, null, 50000, null, null, null),
+          new TaskConfig(testCase.tmpDir.getAbsolutePath(), null, null, 50000, null, false, null, null),
           new TaskActionClientFactory()
           {
             @Override
@@ -334,7 +337,8 @@ public class IngestSegmentFirehoseFactoryTimelineTest
           INDEX_MERGER,
           INDEX_IO,
           null,
-          null
+          null,
+          INDEX_MERGER_V9
       );
       final Injector injector = Guice.createInjector(
           new Module()

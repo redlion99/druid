@@ -66,6 +66,8 @@ import java.util.NoSuchElementException;
  */
 public class GroupByQueryEngine
 {
+  private static final String CTX_KEY_MAX_INTERMEDIATE_ROWS = "maxIntermediateRows";
+
   private final Supplier<GroupByQueryConfig> config;
   private final StupidPool<ByteBuffer> intermediateResultsBufferPool;
 
@@ -93,9 +95,10 @@ public class GroupByQueryEngine
     }
 
     final Sequence<Cursor> cursors = storageAdapter.makeCursors(
-        Filters.convertDimensionFilters(query.getDimFilter()),
+        Filters.toFilter(query.getDimFilter()),
         intervals.get(0),
-        query.getGranularity()
+        query.getGranularity(),
+        false
     );
 
     final ResourceHolder<ByteBuffer> bufferHolder = intermediateResultsBufferPool.take();
@@ -288,7 +291,7 @@ public class GroupByQueryEngine
     private final GroupByQuery query;
     private final Cursor cursor;
     private final ByteBuffer metricsBuffer;
-    private final GroupByQueryConfig config;
+    private final int maxIntermediateRows;
 
     private final List<DimensionSpec> dimensionSpecs;
     private final List<DimensionSelector> dimensions;
@@ -306,7 +309,13 @@ public class GroupByQueryEngine
       this.query = query;
       this.cursor = cursor;
       this.metricsBuffer = metricsBuffer;
-      this.config = config;
+
+      this.maxIntermediateRows = Math.min(
+          query.getContextValue(
+              CTX_KEY_MAX_INTERMEDIATE_ROWS,
+              config.getMaxIntermediateRows()
+          ), config.getMaxIntermediateRows()
+      );
 
       unprocessedKeys = null;
       delegate = Iterators.emptyIterator();
@@ -316,10 +325,7 @@ public class GroupByQueryEngine
 
       for (int i = 0; i < dimensionSpecs.size(); ++i) {
         final DimensionSpec dimSpec = dimensionSpecs.get(i);
-        final DimensionSelector selector = cursor.makeDimensionSelector(
-            dimSpec.getDimension(),
-            dimSpec.getExtractionFn()
-        );
+        final DimensionSelector selector = cursor.makeDimensionSelector(dimSpec);
         if (selector != null) {
           dimensions.add(selector);
           dimNames.add(dimSpec.getOutputName());
@@ -366,7 +372,7 @@ public class GroupByQueryEngine
         }
         cursor.advance();
       }
-      while (!cursor.isDone() && rowUpdater.getNumRows() < config.getMaxIntermediateRows()) {
+      while (!cursor.isDone() && rowUpdater.getNumRows() < maxIntermediateRows) {
         ByteBuffer key = ByteBuffer.allocate(dimensions.size() * Ints.BYTES);
 
         unprocessedKeys = rowUpdater.updateValues(key, dimensions);

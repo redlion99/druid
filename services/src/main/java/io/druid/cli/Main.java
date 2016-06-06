@@ -23,7 +23,6 @@ import com.google.inject.Injector;
 import io.airlift.airline.Cli;
 import io.airlift.airline.Help;
 import io.airlift.airline.ParseException;
-import io.druid.cli.convert.ConvertProperties;
 import io.druid.cli.validate.DruidJsonValidator;
 import io.druid.guice.ExtensionsConfig;
 import io.druid.guice.GuiceInjectors;
@@ -69,7 +68,12 @@ public class Main
     builder.withGroup("tools")
            .withDescription("Various tools for working with Druid")
            .withDefaultCommand(Help.class)
-           .withCommands(ConvertProperties.class, DruidJsonValidator.class, PullDependencies.class, CreateTables.class);
+           .withCommands(
+               DruidJsonValidator.class,
+               PullDependencies.class,
+               CreateTables.class,
+               InsertSegment.class
+           );
 
     builder.withGroup("index")
            .withDescription("Run indexing for druid")

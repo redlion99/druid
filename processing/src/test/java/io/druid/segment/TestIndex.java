@@ -30,7 +30,7 @@ import io.druid.data.input.impl.DelimitedParseSpec;
 import io.druid.data.input.impl.DimensionsSpec;
 import io.druid.data.input.impl.StringInputRowParser;
 import io.druid.data.input.impl.TimestampSpec;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.query.aggregation.AggregatorFactory;
 import io.druid.query.aggregation.DoubleSumAggregatorFactory;
 import io.druid.query.aggregation.hyperloglog.HyperUniquesAggregatorFactory;
@@ -70,11 +70,11 @@ public class TestIndex
       "placementish",
       "partial_null_column",
       "null_column",
-  };
+      };
   public static final String[] METRICS = new String[]{"index"};
   private static final Logger log = new Logger(TestIndex.class);
   private static final Interval DATA_INTERVAL = new Interval("2011-01-12T00:00:00.000Z/2011-05-01T00:00:00.000Z");
-  private static final AggregatorFactory[] METRIC_AGGS = new AggregatorFactory[]{
+  public static final AggregatorFactory[] METRIC_AGGS = new AggregatorFactory[]{
       new DoubleSumAggregatorFactory(METRICS[0], METRICS[0]),
       new HyperUniquesAggregatorFactory("quality_uniques", "quality")
   };
@@ -93,7 +93,7 @@ public class TestIndex
   private static QueryableIndex mmappedIndex = null;
   private static QueryableIndex mergedRealtime = null;
 
-  public static IncrementalIndex getIncrementalTestIndex(boolean useOffheap)
+  public static IncrementalIndex getIncrementalTestIndex()
   {
     synchronized (log) {
       if (realtimeIndex != null) {
@@ -101,7 +101,7 @@ public class TestIndex
       }
     }
 
-    return realtimeIndex = makeRealtimeIndex("druid.sample.tsv", useOffheap);
+    return realtimeIndex = makeRealtimeIndex("druid.sample.tsv");
   }
 
   public static QueryableIndex getMMappedTestIndex()
@@ -112,7 +112,7 @@ public class TestIndex
       }
     }
 
-    IncrementalIndex incrementalIndex = getIncrementalTestIndex(false);
+    IncrementalIndex incrementalIndex = getIncrementalTestIndex();
     mmappedIndex = persistRealtimeAndLoadMMapped(incrementalIndex);
 
     return mmappedIndex;
@@ -126,8 +126,8 @@ public class TestIndex
       }
 
       try {
-        IncrementalIndex top = makeRealtimeIndex("druid.sample.tsv.top", false);
-        IncrementalIndex bottom = makeRealtimeIndex("druid.sample.tsv.bottom", false);
+        IncrementalIndex top = makeRealtimeIndex("druid.sample.tsv.top");
+        IncrementalIndex bottom = makeRealtimeIndex("druid.sample.tsv.bottom");
 
         File tmpFile = File.createTempFile("yay", "who");
         tmpFile.delete();
@@ -143,8 +143,8 @@ public class TestIndex
         mergedFile.mkdirs();
         mergedFile.deleteOnExit();
 
-        INDEX_MERGER.persist(top, DATA_INTERVAL, topFile, null, indexSpec);
-        INDEX_MERGER.persist(bottom, DATA_INTERVAL, bottomFile, null, indexSpec);
+        INDEX_MERGER.persist(top, DATA_INTERVAL, topFile, indexSpec);
+        INDEX_MERGER.persist(bottom, DATA_INTERVAL, bottomFile, indexSpec);
 
         mergedRealtime = INDEX_IO.loadIndex(
             INDEX_MERGER.mergeQueryableIndex(
@@ -163,7 +163,7 @@ public class TestIndex
     }
   }
 
-  private static IncrementalIndex makeRealtimeIndex(final String resourceFilename, final boolean useOffheap)
+  public static IncrementalIndex makeRealtimeIndex(final String resourceFilename)
   {
     final URL resource = TestIndex.class.getClassLoader().getResource(resourceFilename);
     if (resource == null) {
@@ -171,64 +171,78 @@ public class TestIndex
     }
     log.info("Realtime loading index file[%s]", resource);
     CharSource stream = Resources.asByteSource(resource).asCharSource(Charsets.UTF_8);
-    return makeRealtimeIndex(stream, useOffheap);
+    return makeRealtimeIndex(stream);
   }
 
-  public static IncrementalIndex makeRealtimeIndex(final CharSource source, final boolean useOffheap)
+  public static IncrementalIndex makeRealtimeIndex(final CharSource source)
   {
     final IncrementalIndexSchema schema = new IncrementalIndexSchema.Builder()
         .withMinTimestamp(new DateTime("2011-01-12T00:00:00.000Z").getMillis())
-        .withQueryGranularity(QueryGranularity.NONE)
+        .withQueryGranularity(QueryGranularities.NONE)
         .withMetrics(METRIC_AGGS)
         .build();
-    final IncrementalIndex retVal = new OnheapIncrementalIndex(
-        schema,
-        10000
-    );
+    final IncrementalIndex retVal = new OnheapIncrementalIndex(schema, true, 10000);
 
-    final AtomicLong startTime = new AtomicLong();
-    int lineCount;
     try {
-      lineCount = source.readLines(
-          new LineProcessor<Integer>()
-          {
-            StringInputRowParser parser = new StringInputRowParser(
-                new DelimitedParseSpec(
-                    new TimestampSpec("ts", "iso", null),
-                    new DimensionsSpec(Arrays.asList(DIMENSIONS), null, null),
-                    "\t",
-                    "\u0001",
-                    Arrays.asList(COLUMNS)
-                )
-            );
-            boolean runOnce = false;
-            int lineCount = 0;
-
-            @Override
-            public boolean processLine(String line) throws IOException
-            {
-              if (!runOnce) {
-                startTime.set(System.currentTimeMillis());
-                runOnce = true;
-              }
-              retVal.add(parser.parse(line));
-
-              ++lineCount;
-              return true;
-            }
-
-            @Override
-            public Integer getResult()
-            {
-              return lineCount;
-            }
-          }
-      );
+      return loadIncrementalIndex(retVal, source);
     }
-    catch (IOException e) {
+    catch (Exception e) {
       realtimeIndex = null;
       throw Throwables.propagate(e);
     }
+  }
+
+  public static IncrementalIndex loadIncrementalIndex(
+      final IncrementalIndex retVal,
+      final CharSource source
+  ) throws IOException
+  {
+    final StringInputRowParser parser = new StringInputRowParser(
+        new DelimitedParseSpec(
+            new TimestampSpec("ts", "iso", null),
+            new DimensionsSpec(DimensionsSpec.getDefaultSchemas(Arrays.asList(DIMENSIONS)), null, null),
+            "\t",
+            "\u0001",
+            Arrays.asList(COLUMNS)
+        )
+        , "utf8"
+    );
+    return loadIncrementalIndex(retVal, source, parser);
+  }
+
+  public static IncrementalIndex loadIncrementalIndex(
+      final IncrementalIndex retVal,
+      final CharSource source,
+      final StringInputRowParser parser
+  ) throws IOException
+  {
+    final AtomicLong startTime = new AtomicLong();
+    int lineCount = source.readLines(
+        new LineProcessor<Integer>()
+        {
+          boolean runOnce = false;
+          int lineCount = 0;
+
+          @Override
+          public boolean processLine(String line) throws IOException
+          {
+            if (!runOnce) {
+              startTime.set(System.currentTimeMillis());
+              runOnce = true;
+            }
+            retVal.add(parser.parse(line));
+
+            ++lineCount;
+            return true;
+          }
+
+          @Override
+          public Integer getResult()
+          {
+            return lineCount;
+          }
+        }
+    );
 
     log.info("Loaded %,d lines in %,d millis.", lineCount, System.currentTimeMillis() - startTime.get());
 
@@ -243,7 +257,7 @@ public class TestIndex
       someTmpFile.mkdirs();
       someTmpFile.deleteOnExit();
 
-      INDEX_MERGER.persist(index, someTmpFile, null, indexSpec);
+      INDEX_MERGER.persist(index, someTmpFile, indexSpec);
       return INDEX_IO.loadIndex(someTmpFile);
     }
     catch (IOException e) {

@@ -19,42 +19,52 @@
 
 package io.druid.indexing.overlord;
 
+import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.inject.Inject;
+import com.metamx.common.ISE;
 import com.metamx.common.Pair;
 import com.metamx.common.lifecycle.LifecycleStop;
 import com.metamx.emitter.EmittingLogger;
-import com.metamx.emitter.service.AlertEvent;
 import com.metamx.emitter.service.ServiceEmitter;
 import com.metamx.emitter.service.ServiceMetricEvent;
 import io.druid.concurrent.Execs;
+import io.druid.concurrent.TaskThreadPriority;
+import io.druid.guice.annotations.Self;
+import io.druid.indexing.common.TaskLocation;
 import io.druid.indexing.common.TaskStatus;
 import io.druid.indexing.common.TaskToolbox;
 import io.druid.indexing.common.TaskToolboxFactory;
 import io.druid.indexing.common.config.TaskConfig;
 import io.druid.indexing.common.task.Task;
+import io.druid.indexing.overlord.autoscaling.ScalingStats;
 import io.druid.query.NoopQueryRunner;
 import io.druid.query.Query;
 import io.druid.query.QueryRunner;
 import io.druid.query.QuerySegmentWalker;
 import io.druid.query.SegmentDescriptor;
+import io.druid.server.DruidNode;
 import org.joda.time.DateTime;
 import org.joda.time.Interval;
 
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -66,21 +76,28 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
 
   private final TaskToolboxFactory toolboxFactory;
   private final TaskConfig taskConfig;
-  private final ListeningExecutorService exec;
-  private final Set<ThreadPoolTaskRunnerWorkItem> runningItems = new ConcurrentSkipListSet<>();
+  private final ConcurrentMap<Integer, ListeningExecutorService> exec = new ConcurrentHashMap<>();
+  private final Set<ThreadPoolTaskRunnerWorkItem> runningItems = new ConcurrentSkipListSet<>(
+      ThreadPoolTaskRunnerWorkItem.COMPARATOR
+  );
+  private final CopyOnWriteArrayList<Pair<TaskRunnerListener, Executor>> listeners = new CopyOnWriteArrayList<>();
   private final ServiceEmitter emitter;
+  private final TaskLocation location;
+
+  private volatile boolean stopping = false;
 
   @Inject
   public ThreadPoolTaskRunner(
       TaskToolboxFactory toolboxFactory,
       TaskConfig taskConfig,
-      ServiceEmitter emitter
+      ServiceEmitter emitter,
+      @Self DruidNode node
   )
   {
     this.toolboxFactory = Preconditions.checkNotNull(toolboxFactory, "toolboxFactory");
     this.taskConfig = taskConfig;
-    this.exec = MoreExecutors.listeningDecorator(Execs.singleThreaded("task-runner-%d"));
     this.emitter = Preconditions.checkNotNull(emitter, "emitter");
+    this.location = TaskLocation.create(node.getHost(), node.getPort());
   }
 
   @Override
@@ -89,10 +106,63 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
     return ImmutableList.of();
   }
 
+  @Override
+  public void registerListener(TaskRunnerListener listener, Executor executor)
+  {
+    for (Pair<TaskRunnerListener, Executor> pair : listeners) {
+      if (pair.lhs.getListenerId().equals(listener.getListenerId())) {
+        throw new ISE("Listener [%s] already registered", listener.getListenerId());
+      }
+    }
+
+    final Pair<TaskRunnerListener, Executor> listenerPair = Pair.of(listener, executor);
+
+    // Location never changes for an existing task, so it's ok to add the listener first and then issue bootstrap
+    // callbacks without any special synchronization.
+
+    listeners.add(listenerPair);
+    log.info("Registered listener [%s]", listener.getListenerId());
+    for (ThreadPoolTaskRunnerWorkItem item : runningItems) {
+      TaskRunnerUtils.notifyLocationChanged(ImmutableList.of(listenerPair), item.getTaskId(), item.getLocation());
+    }
+  }
+
+  @Override
+  public void unregisterListener(String listenerId)
+  {
+    for (Pair<TaskRunnerListener, Executor> pair : listeners) {
+      if (pair.lhs.getListenerId().equals(listenerId)) {
+        listeners.remove(pair);
+        log.info("Unregistered listener [%s]", listenerId);
+        return;
+      }
+    }
+  }
+
+  private static ListeningExecutorService buildExecutorService(int priority)
+  {
+    return MoreExecutors.listeningDecorator(
+        Execs.singleThreaded(
+            "task-runner-%d-priority-" + priority,
+            TaskThreadPriority.getThreadPriorityFromTaskPriority(priority)
+        )
+    );
+  }
+
+  @Override
   @LifecycleStop
   public void stop()
   {
-    exec.shutdown();
+    stopping = true;
+
+    for (Map.Entry<Integer, ListeningExecutorService> entry : exec.entrySet()) {
+      try {
+        entry.getValue().shutdown();
+      }
+      catch (SecurityException ex) {
+        log.wtf(ex, "I can't control my own threads!");
+      }
+    }
 
     for (ThreadPoolTaskRunnerWorkItem item : runningItems) {
       final Task task = item.getTask();
@@ -101,7 +171,7 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
       final long elapsed;
       boolean error = false;
 
-      if (task.canRestore()) {
+      if (taskConfig.isRestoreTasksOnRestart() && task.canRestore()) {
         // Attempt graceful shutdown.
         graceful = true;
         log.info("Starting graceful shutdown of task[%s].", task.getId());
@@ -112,23 +182,28 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
               new Interval(new DateTime(start), taskConfig.getGracefulShutdownTimeout()).toDurationMillis(),
               TimeUnit.MILLISECONDS
           );
+
+          // Ignore status, it doesn't matter for graceful shutdowns.
           log.info(
-              "Graceful shutdown of task[%s] finished in %,dms with status[%s].",
+              "Graceful shutdown of task[%s] finished in %,dms.",
               task.getId(),
-              System.currentTimeMillis() - start,
-              taskStatus.getStatusCode()
+              System.currentTimeMillis() - start
           );
+
+          TaskRunnerUtils.notifyStatusChanged(listeners, task.getId(), taskStatus);
         }
         catch (Exception e) {
           log.makeAlert(e, "Graceful task shutdown failed: %s", task.getDataSource())
              .addData("taskId", task.getId())
              .addData("dataSource", task.getDataSource())
              .emit();
-          log.warn(e, "Graceful shutdown of task[%s] aborted with exception.");
+          log.warn(e, "Graceful shutdown of task[%s] aborted with exception.", task.getId());
           error = true;
+          TaskRunnerUtils.notifyStatusChanged(listeners, task.getId(), TaskStatus.failure(task.getId()));
         }
       } else {
         graceful = false;
+        TaskRunnerUtils.notifyStatusChanged(listeners, task.getId(), TaskStatus.failure(task.getId()));
       }
 
       elapsed = System.currentTimeMillis() - start;
@@ -145,15 +220,53 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
     }
 
     // Ok, now interrupt everything.
-    exec.shutdownNow();
+    for (Map.Entry<Integer, ListeningExecutorService> entry : exec.entrySet()) {
+      try {
+        entry.getValue().shutdownNow();
+      }
+      catch (SecurityException ex) {
+        log.wtf(ex, "I can't control my own threads!");
+      }
+    }
   }
 
   @Override
   public ListenableFuture<TaskStatus> run(final Task task)
   {
     final TaskToolbox toolbox = toolboxFactory.build(task);
-    final ListenableFuture<TaskStatus> statusFuture = exec.submit(new ThreadPoolTaskRunnerCallable(task, toolbox));
-    final ThreadPoolTaskRunnerWorkItem taskRunnerWorkItem = new ThreadPoolTaskRunnerWorkItem(task, statusFuture);
+    final Object taskPriorityObj = task.getContextValue(TaskThreadPriority.CONTEXT_KEY);
+    int taskPriority = 0;
+    if (taskPriorityObj != null) {
+      if (taskPriorityObj instanceof Number) {
+        taskPriority = ((Number) taskPriorityObj).intValue();
+      } else if (taskPriorityObj instanceof String) {
+        try {
+          taskPriority = Integer.parseInt(taskPriorityObj.toString());
+        }
+        catch (NumberFormatException e) {
+          log.error(e, "Error parsing task priority [%s] for task [%s]", taskPriorityObj, task.getId());
+        }
+      }
+    }
+    // Ensure an executor for that priority exists
+    if (!exec.containsKey(taskPriority)) {
+      final ListeningExecutorService executorService = buildExecutorService(taskPriority);
+      if (exec.putIfAbsent(taskPriority, executorService) != null) {
+        // favor prior service
+        executorService.shutdownNow();
+      }
+    }
+    final ListenableFuture<TaskStatus> statusFuture = exec.get(taskPriority)
+                                                          .submit(new ThreadPoolTaskRunnerCallable(
+                                                              task,
+                                                              location,
+                                                              toolbox
+                                                          ));
+    final ThreadPoolTaskRunnerWorkItem taskRunnerWorkItem = new ThreadPoolTaskRunnerWorkItem(
+        task,
+        location,
+        statusFuture
+    );
     runningItems.add(taskRunnerWorkItem);
     Futures.addCallback(
         statusFuture, new FutureCallback<TaskStatus>()
@@ -204,9 +317,15 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
   }
 
   @Override
-  public Collection<ZkWorker> getWorkers()
+  public Optional<ScalingStats> getScalingStats()
   {
-    return Lists.newArrayList();
+    return Optional.absent();
+  }
+
+  @Override
+  public void start()
+  {
+    // No state startup required
   }
 
   @Override
@@ -248,31 +367,54 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
 
   private static class ThreadPoolTaskRunnerWorkItem extends TaskRunnerWorkItem
   {
+    private static final Comparator<ThreadPoolTaskRunnerWorkItem> COMPARATOR = new Comparator<ThreadPoolTaskRunnerWorkItem>()
+    {
+      @Override
+      public int compare(
+          ThreadPoolTaskRunnerWorkItem lhs,
+          ThreadPoolTaskRunnerWorkItem rhs
+      )
+      {
+        return lhs.getTaskId().compareTo(rhs.getTaskId());
+      }
+    };
+
     private final Task task;
+    private final TaskLocation location;
 
     private ThreadPoolTaskRunnerWorkItem(
         Task task,
+        TaskLocation location,
         ListenableFuture<TaskStatus> result
     )
     {
       super(task.getId(), result);
       this.task = task;
+      this.location = location;
     }
 
     public Task getTask()
     {
       return task;
     }
+
+    @Override
+    public TaskLocation getLocation()
+    {
+      return location;
+    }
   }
 
-  private static class ThreadPoolTaskRunnerCallable implements Callable<TaskStatus>
+  private class ThreadPoolTaskRunnerCallable implements Callable<TaskStatus>
   {
     private final Task task;
+    private final TaskLocation location;
     private final TaskToolbox toolbox;
 
-    public ThreadPoolTaskRunnerCallable(Task task, TaskToolbox toolbox)
+    public ThreadPoolTaskRunnerCallable(Task task, TaskLocation location, TaskToolbox toolbox)
     {
       this.task = task;
+      this.location = location;
       this.toolbox = toolbox;
     }
 
@@ -285,11 +427,25 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
 
       try {
         log.info("Running task: %s", task.getId());
+        TaskRunnerUtils.notifyLocationChanged(
+            listeners,
+            task.getId(),
+            location
+        );
+        TaskRunnerUtils.notifyStatusChanged(listeners, task.getId(), TaskStatus.running(task.getId()));
         status = task.run(toolbox);
       }
       catch (InterruptedException e) {
-        log.error(e, "Interrupted while running task[%s]", task);
-        throw Throwables.propagate(e);
+        // Don't reset the interrupt flag of the thread, as we do want to continue to the end of this callable.
+        if (stopping) {
+          // Tasks may interrupt their own run threads to stop themselves gracefully; don't be too scary about this.
+          log.debug(e, "Interrupted while running task[%s] during graceful shutdown.", task);
+        } else {
+          // Not stopping, this is definitely unexpected.
+          log.warn(e, "Interrupted while running task[%s]", task);
+        }
+
+        status = TaskStatus.failure(task.getId());
       }
       catch (Exception e) {
         log.error(e, "Exception while running task[%s]", task);
@@ -297,16 +453,12 @@ public class ThreadPoolTaskRunner implements TaskRunner, QuerySegmentWalker
       }
       catch (Throwable t) {
         log.error(t, "Uncaught Throwable while running task[%s]", task);
-        throw Throwables.propagate(t);
+        throw t;
       }
 
-      try {
-        return status.withDuration(System.currentTimeMillis() - startTime);
-      }
-      catch (Exception e) {
-        log.error(e, "Uncaught Exception during callback for task[%s]", task);
-        throw Throwables.propagate(e);
-      }
+      status = status.withDuration(System.currentTimeMillis() - startTime);
+      TaskRunnerUtils.notifyStatusChanged(listeners, task.getId(), status);
+      return status;
     }
   }
 }

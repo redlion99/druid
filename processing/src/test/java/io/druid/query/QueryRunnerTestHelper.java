@@ -25,8 +25,12 @@ import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.metamx.common.UOE;
+import com.metamx.common.guava.MergeSequence;
 import com.metamx.common.guava.Sequence;
+import com.metamx.common.guava.Sequences;
 import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
+import io.druid.js.JavaScriptConfig;
 import io.druid.query.aggregation.AggregatorFactory;
 import io.druid.query.aggregation.CountAggregatorFactory;
 import io.druid.query.aggregation.DoubleSumAggregatorFactory;
@@ -40,12 +44,15 @@ import io.druid.query.aggregation.post.ConstantPostAggregator;
 import io.druid.query.aggregation.post.FieldAccessPostAggregator;
 import io.druid.query.spec.MultipleIntervalSegmentSpec;
 import io.druid.query.spec.QuerySegmentSpec;
+import io.druid.query.spec.SpecificSegmentSpec;
 import io.druid.segment.IncrementalIndexSegment;
 import io.druid.segment.QueryableIndex;
 import io.druid.segment.QueryableIndexSegment;
 import io.druid.segment.Segment;
 import io.druid.segment.TestIndex;
 import io.druid.segment.incremental.IncrementalIndex;
+import io.druid.timeline.TimelineObjectHolder;
+import io.druid.timeline.VersionedIntervalTimeline;
 import org.joda.time.DateTime;
 import org.joda.time.Interval;
 
@@ -54,6 +61,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -87,15 +95,28 @@ public class QueryRunnerTestHelper
           }
       )
   );
-  public static final QueryGranularity dayGran = QueryGranularity.DAY;
-  public static final QueryGranularity allGran = QueryGranularity.ALL;
+
+  public static final DateTime minTime = new DateTime("2011-01-12T00:00:00.000Z");
+
+  public static final QueryGranularity dayGran = QueryGranularities.DAY;
+  public static final QueryGranularity allGran = QueryGranularities.ALL;
   public static final String marketDimension = "market";
   public static final String qualityDimension = "quality";
   public static final String placementDimension = "placement";
   public static final String placementishDimension = "placementish";
+  public static final String partialNullDimension = "partial_null_column";
+
+  public static final List<String> dimensions = Lists.newArrayList(
+      marketDimension,
+      qualityDimension,
+      placementDimension,
+      placementishDimension
+  );
   public static final String indexMetric = "index";
   public static final String uniqueMetric = "uniques";
   public static final String addRowsIndexConstantMetric = "addRowsIndexConstant";
+  public static final List<String> metrics = Lists.newArrayList(indexMetric, uniqueMetric, addRowsIndexConstantMetric);
+
   public static String dependentPostAggMetric = "dependentPostAgg";
   public static final CountAggregatorFactory rowsCount = new CountAggregatorFactory("rows");
   public static final LongSumAggregatorFactory indexLongSum = new LongSumAggregatorFactory("index", "index");
@@ -108,7 +129,8 @@ public class QueryRunnerTestHelper
       Arrays.asList("placementish", "index"),
       "function aggregate(current, a, b) { if ((Array.isArray(a) && a.indexOf('a') > -1) || a === 'a') { return current + b; } else { return current; } }",
       JS_RESET_0,
-      JS_COMBINE_A_PLUS_B
+      JS_COMBINE_A_PLUS_B,
+      JavaScriptConfig.getDefault()
   );
   public static final JavaScriptAggregatorFactory jsCountIfTimeGreaterThan = new JavaScriptAggregatorFactory(
       "ntimestamps",
@@ -117,14 +139,16 @@ public class QueryRunnerTestHelper
       new DateTime("2011-04-01T12:00:00Z").getMillis() +
       ") { return current + 1; } else { return current; } }",
       JS_RESET_0,
-      JS_COMBINE_A_PLUS_B
+      JS_COMBINE_A_PLUS_B,
+      JavaScriptConfig.getDefault()
   );
   public static final JavaScriptAggregatorFactory jsPlacementishCount = new JavaScriptAggregatorFactory(
       "pishcount",
       Arrays.asList("placementish", "index"),
       "function aggregate(current, a) { if (Array.isArray(a)) { return current + a.length; } else if (typeof a === 'string') { return current + 1; } else { return current; } }",
       JS_RESET_0,
-      JS_COMBINE_A_PLUS_B
+      JS_COMBINE_A_PLUS_B,
+      JavaScriptConfig.getDefault()
   );
   public static final HyperUniquesAggregatorFactory qualityUniques = new HyperUniquesAggregatorFactory(
       "uniques",
@@ -192,6 +216,17 @@ public class QueryRunnerTestHelper
       "5506.567192077637", "4743.144546508789", "4913.282669067383", "4723.869743347168"
   };
 
+  public static final String[] expectedFullOnIndexValuesDesc;
+
+  static {
+    List<String> list = new ArrayList(Arrays.asList(expectedFullOnIndexValues));
+    Collections.reverse(list);
+    expectedFullOnIndexValuesDesc = list.toArray(new String[list.size()]);
+  }
+
+  public static final DateTime earliest = new DateTime("2011-01-12");
+  public static final DateTime last = new DateTime("2011-04-15");
+
   public static final DateTime skippedDay = new DateTime("2011-01-21T00:00:00.000Z");
 
   public static final QuerySegmentSpec firstToThird = new MultipleIntervalSegmentSpec(
@@ -222,20 +257,78 @@ public class QueryRunnerTestHelper
     );
   }
 
+  // simple cartesian iterable
+  public static Iterable<Object[]> cartesian(final Iterable... iterables)
+  {
+    return new Iterable<Object[]>()
+    {
+
+      @Override
+      public Iterator<Object[]> iterator()
+      {
+        return new Iterator<Object[]>()
+        {
+          private final Iterator[] iterators = new Iterator[iterables.length];
+          private final Object[] cached = new Object[iterables.length];
+
+          @Override
+          public boolean hasNext()
+          {
+            return hasNext(0);
+          }
+
+          private boolean hasNext(int index)
+          {
+            if (iterators[index] == null) {
+              iterators[index] = iterables[index].iterator();
+            }
+            for (; hasMore(index); cached[index] = null) {
+              if (index == iterables.length - 1 || hasNext(index + 1)) {
+                return true;
+              }
+            }
+            iterators[index] = null;
+            return false;
+          }
+
+          private boolean hasMore(int index)
+          {
+            if (cached[index] == null && iterators[index].hasNext()) {
+              cached[index] = iterators[index].next();
+            }
+            return cached[index] != null;
+          }
+
+          @Override
+          public Object[] next()
+          {
+            Object[] result = Arrays.copyOf(cached, cached.length);
+            cached[cached.length - 1] = null;
+            return result;
+          }
+
+          @Override
+          public void remove()
+          {
+            throw new UnsupportedOperationException("remove");
+          }
+        };
+      }
+    };
+  }
+
   public static <T, QueryType extends Query<T>> List<QueryRunner<T>> makeQueryRunners(
       QueryRunnerFactory<T, QueryType> factory
   )
       throws IOException
   {
-    final IncrementalIndex rtIndex = TestIndex.getIncrementalTestIndex(false);
+    final IncrementalIndex rtIndex = TestIndex.getIncrementalTestIndex();
     final QueryableIndex mMappedTestIndex = TestIndex.getMMappedTestIndex();
     final QueryableIndex mergedRealtimeIndex = TestIndex.mergedRealtimeIndex();
-    final IncrementalIndex rtIndexOffheap = TestIndex.getIncrementalTestIndex(true);
     return ImmutableList.of(
         makeQueryRunner(factory, new IncrementalIndexSegment(rtIndex, segmentId)),
         makeQueryRunner(factory, new QueryableIndexSegment(segmentId, mMappedTestIndex)),
-        makeQueryRunner(factory, new QueryableIndexSegment(segmentId, mergedRealtimeIndex)),
-        makeQueryRunner(factory, new IncrementalIndexSegment(rtIndexOffheap, segmentId))
+        makeQueryRunner(factory, new QueryableIndexSegment(segmentId, mergedRealtimeIndex))
     );
   }
 
@@ -246,29 +339,17 @@ public class QueryRunnerTestHelper
   )
       throws IOException
   {
-    final IncrementalIndex rtIndex = TestIndex.getIncrementalTestIndex(false);
+    final IncrementalIndex rtIndex = TestIndex.getIncrementalTestIndex();
     final QueryableIndex mMappedTestIndex = TestIndex.getMMappedTestIndex();
     final QueryableIndex mergedRealtimeIndex = TestIndex.mergedRealtimeIndex();
-    final IncrementalIndex rtIndexOffheap = TestIndex.getIncrementalTestIndex(true);
 
     return Arrays.asList(
-        new Object[][]{
-            {
-                makeUnionQueryRunner(factory, new IncrementalIndexSegment(rtIndex, segmentId))
-            },
-            {
-                makeUnionQueryRunner(factory, new QueryableIndexSegment(segmentId, mMappedTestIndex))
-            },
-            {
-                makeUnionQueryRunner(
-                    factory,
-                    new QueryableIndexSegment(segmentId, mergedRealtimeIndex)
-                )
-            },
-            {
-                makeUnionQueryRunner(factory, new IncrementalIndexSegment(rtIndexOffheap, segmentId))
-            }
-        }
+        makeUnionQueryRunner(factory, new IncrementalIndexSegment(rtIndex, segmentId)),
+        makeUnionQueryRunner(factory, new QueryableIndexSegment(segmentId, mMappedTestIndex)),
+        makeUnionQueryRunner(
+            factory,
+            new QueryableIndexSegment(segmentId, mergedRealtimeIndex)
+        )
     );
   }
   /**
@@ -328,6 +409,18 @@ public class QueryRunnerTestHelper
 
   public static <T, QueryType extends Query<T>> QueryRunner<T> makeQueryRunner(
       QueryRunnerFactory<T, QueryType> factory,
+      String resourceFileName
+  )
+  {
+    return makeQueryRunner(
+        factory,
+        segmentId,
+        new IncrementalIndexSegment(TestIndex.makeRealtimeIndex(resourceFileName), segmentId)
+    );
+  }
+
+  public static <T, QueryType extends Query<T>> QueryRunner<T> makeQueryRunner(
+      QueryRunnerFactory<T, QueryType> factory,
       Segment adapter
   )
   {
@@ -354,20 +447,56 @@ public class QueryRunnerTestHelper
       Segment adapter
   )
   {
-    return new FinalizeResultsQueryRunner<T>(
-        factory.getToolchest().postMergeQueryDecoration(
-            factory.getToolchest().mergeResults(
-                new UnionQueryRunner<T>(
-                    new BySegmentQueryRunner<T>(
-                        segmentId, adapter.getDataInterval().getStart(),
-                        factory.createRunner(adapter)
-                    ),
-                    factory.getToolchest()
+    return new FluentQueryRunnerBuilder<T>(factory.getToolchest())
+        .create(
+            new UnionQueryRunner<T>(
+                new BySegmentQueryRunner<T>(
+                    segmentId, adapter.getDataInterval().getStart(),
+                    factory.createRunner(adapter)
                 )
             )
-        ),
-        factory.getToolchest()
-    );
+        )
+        .mergeResults()
+        .applyPostMergeDecoration();
+  }
+
+  public static <T> QueryRunner<T> makeFilteringQueryRunner(
+      final VersionedIntervalTimeline<String, Segment> timeline,
+      final QueryRunnerFactory<T, Query<T>> factory) {
+
+    final QueryToolChest<T, Query<T>> toolChest = factory.getToolchest();
+    return new FluentQueryRunnerBuilder<T>(toolChest)
+        .create(
+            new QueryRunner<T>()
+            {
+              @Override
+              public Sequence<T> run(Query<T> query, Map<String, Object> responseContext)
+              {
+                List<TimelineObjectHolder> segments = Lists.newArrayList();
+                for (Interval interval : query.getIntervals()) {
+                  segments.addAll(timeline.lookup(interval));
+                }
+                List<Sequence<T>> sequences = Lists.newArrayList();
+                for (TimelineObjectHolder<String, Segment> holder : toolChest.filterSegments(query, segments)) {
+                  Segment segment = holder.getObject().getChunk(0).getObject();
+                  Query running = query.withQuerySegmentSpec(
+                      new SpecificSegmentSpec(
+                          new SegmentDescriptor(
+                              holder.getInterval(),
+                              holder.getVersion(),
+                              0
+                          )
+                      )
+                  );
+                  sequences.add(factory.createRunner(segment).run(running, responseContext));
+                }
+                return new MergeSequence<>(query.getResultOrdering(), Sequences.simple(sequences));
+              }
+            }
+        )
+        .applyPreMergeDecoration()
+        .mergeResults()
+        .applyPostMergeDecoration();
   }
 
   public static IntervalChunkingQueryRunnerDecorator NoopIntervalChunkingQueryRunnerDecorator()

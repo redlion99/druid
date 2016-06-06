@@ -22,8 +22,6 @@ package io.druid.indexing.overlord;
 import com.google.common.base.Optional;
 import com.google.common.base.Throwables;
 import com.google.inject.Inject;
-import com.metamx.common.concurrent.ScheduledExecutorFactory;
-import com.metamx.common.concurrent.ScheduledExecutors;
 import com.metamx.common.lifecycle.Lifecycle;
 import com.metamx.common.lifecycle.LifecycleStart;
 import com.metamx.common.lifecycle.LifecycleStop;
@@ -34,9 +32,9 @@ import io.druid.guice.annotations.Self;
 import io.druid.indexing.common.actions.TaskActionClient;
 import io.druid.indexing.common.actions.TaskActionClientFactory;
 import io.druid.indexing.common.task.Task;
-import io.druid.indexing.overlord.autoscaling.ResourceManagementScheduler;
-import io.druid.indexing.overlord.autoscaling.ResourceManagementSchedulerFactory;
+import io.druid.indexing.overlord.autoscaling.ScalingStats;
 import io.druid.indexing.overlord.config.TaskQueueConfig;
+import io.druid.indexing.overlord.supervisor.SupervisorManager;
 import io.druid.server.DruidNode;
 import io.druid.server.initialization.IndexerZkConfig;
 import org.apache.curator.framework.CuratorFramework;
@@ -58,13 +56,13 @@ public class TaskMaster
   private final ReentrantLock giant = new ReentrantLock();
   private final Condition mayBeStopped = giant.newCondition();
   private final TaskActionClientFactory taskActionClientFactory;
+  private final SupervisorManager supervisorManager;
 
   private final AtomicReference<Lifecycle> leaderLifecycleRef = new AtomicReference<>(null);
 
   private volatile boolean leading = false;
   private volatile TaskRunner taskRunner;
   private volatile TaskQueue taskQueue;
-  private volatile ResourceManagementScheduler resourceManagementScheduler;
 
   private static final EmittingLogger log = new EmittingLogger(TaskMaster.class);
 
@@ -77,12 +75,13 @@ public class TaskMaster
       @Self final DruidNode node,
       final IndexerZkConfig zkPaths,
       final TaskRunnerFactory runnerFactory,
-      final ResourceManagementSchedulerFactory managementSchedulerFactory,
       final CuratorFramework curator,
       final ServiceAnnouncer serviceAnnouncer,
-      final ServiceEmitter emitter
+      final ServiceEmitter emitter,
+      final SupervisorManager supervisorManager
   )
   {
+    this.supervisorManager = supervisorManager;
     this.taskActionClientFactory = taskActionClientFactory;
     this.leaderSelector = new LeaderSelector(
         curator,
@@ -117,16 +116,11 @@ public class TaskMaster
                 log.makeAlert("TaskMaster set a new Lifecycle without the old one being cleared!  Race condition")
                    .emit();
               }
+
               leaderLifecycle.addManagedInstance(taskRunner);
-              if (taskRunner instanceof RemoteTaskRunner) {
-                final ScheduledExecutorFactory executorFactory = ScheduledExecutors.createFactory(leaderLifecycle);
-                resourceManagementScheduler = managementSchedulerFactory.build(
-                    (RemoteTaskRunner) taskRunner,
-                    executorFactory
-                );
-                leaderLifecycle.addManagedInstance(resourceManagementScheduler);
-              }
               leaderLifecycle.addManagedInstance(taskQueue);
+              leaderLifecycle.addManagedInstance(supervisorManager);
+
               leaderLifecycle.addHandler(
                   new Lifecycle.Handler()
                   {
@@ -285,10 +279,19 @@ public class TaskMaster
     }
   }
 
-  public Optional<ResourceManagementScheduler> getResourceManagementScheduler()
+  public Optional<ScalingStats> getScalingStats()
   {
     if (leading) {
-      return Optional.fromNullable(resourceManagementScheduler);
+      return taskRunner.getScalingStats();
+    } else {
+      return Optional.absent();
+    }
+  }
+
+  public Optional<SupervisorManager> getSupervisorManager()
+  {
+    if (leading) {
+      return Optional.of(supervisorManager);
     } else {
       return Optional.absent();
     }

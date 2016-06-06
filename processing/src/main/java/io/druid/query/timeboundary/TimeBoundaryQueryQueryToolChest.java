@@ -25,12 +25,9 @@ import com.google.common.base.Functions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Ordering;
-import com.metamx.common.guava.MergeSequence;
 import com.metamx.common.guava.Sequence;
 import com.metamx.common.guava.Sequences;
 import com.metamx.emitter.service.ServiceMetricEvent;
-import io.druid.collections.OrderedMergeSequence;
 import io.druid.query.BySegmentSkippingQueryRunner;
 import io.druid.query.CacheStrategy;
 import io.druid.query.DataSourceUtil;
@@ -68,8 +65,8 @@ public class TimeBoundaryQueryQueryToolChest
       return segments;
     }
 
-    final T min = segments.get(0);
-    final T max = segments.get(segments.size() - 1);
+    final T min = query.isMaxTime() ? null : segments.get(0);
+    final T max = query.isMinTime() ? null : segments.get(segments.size() - 1);
 
     return Lists.newArrayList(
         Iterables.filter(
@@ -107,18 +104,6 @@ public class TimeBoundaryQueryQueryToolChest
         );
       }
     };
-  }
-
-  @Override
-  public Sequence<Result<TimeBoundaryResultValue>> mergeSequences(Sequence<Sequence<Result<TimeBoundaryResultValue>>> seqOfSequences)
-  {
-    return new OrderedMergeSequence<>(getOrdering(), seqOfSequences);
-  }
-
-  @Override
-  public Sequence<Result<TimeBoundaryResultValue>> mergeSequencesUnordered(Sequence<Sequence<Result<TimeBoundaryResultValue>>> seqOfSequences)
-  {
-    return new MergeSequence<>(getOrdering(), seqOfSequences);
   }
 
   @Override
@@ -195,17 +180,6 @@ public class TimeBoundaryQueryQueryToolChest
           }
         };
       }
-
-      @Override
-      public Sequence<Result<TimeBoundaryResultValue>> mergeSequences(Sequence<Sequence<Result<TimeBoundaryResultValue>>> seqOfSequences)
-      {
-        return new MergeSequence<>(getOrdering(), seqOfSequences);
-      }
     };
-  }
-
-  public Ordering<Result<TimeBoundaryResultValue>> getOrdering()
-  {
-    return Ordering.natural();
   }
 }

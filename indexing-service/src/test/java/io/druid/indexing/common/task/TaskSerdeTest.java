@@ -27,7 +27,7 @@ import com.metamx.common.Granularity;
 import io.druid.client.indexing.ClientAppendQuery;
 import io.druid.client.indexing.ClientKillQuery;
 import io.druid.client.indexing.ClientMergeQuery;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.guice.FirehoseModule;
 import io.druid.indexer.HadoopIOConfig;
 import io.druid.indexer.HadoopIngestionSpec;
@@ -91,7 +91,7 @@ public class TaskSerdeTest
                 jsonMapper
             ),
             new IndexTask.IndexIOConfig(new LocalFirehoseFactory(new File("lol"), "rofl", null)),
-            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec)
+            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec, null)
         ),
         jsonMapper,
         null
@@ -132,7 +132,7 @@ public class TaskSerdeTest
                 jsonMapper
             ),
             new IndexTask.IndexIOConfig(new LocalFirehoseFactory(new File("lol"), "rofl", null)),
-            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec)
+            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec, null)
         ),
         jsonMapper,
         null
@@ -306,7 +306,7 @@ public class TaskSerdeTest
                 "foo",
                 null,
                 new AggregatorFactory[0],
-                new UniformGranularitySpec(Granularity.HOUR, QueryGranularity.NONE, null),
+                new UniformGranularitySpec(Granularity.HOUR, QueryGranularities.NONE, null),
                 jsonMapper
             ),
             new RealtimeIOConfig(
@@ -332,7 +332,12 @@ public class TaskSerdeTest
                 null,
                 1,
                 new NoneShardSpec(),
-                indexSpec
+                indexSpec,
+                null,
+                0,
+                0,
+                true,
+                null
             )
         ),
         null
@@ -355,6 +360,7 @@ public class TaskSerdeTest
         Granularity.HOUR,
         task.getRealtimeIngestionSchema().getDataSchema().getGranularitySpec().getSegmentGranularity()
     );
+    Assert.assertTrue(task.getRealtimeIngestionSchema().getTuningConfig().isReportParseExceptions());
 
     Assert.assertEquals(task.getId(), task2.getId());
     Assert.assertEquals(task.getGroupId(), task2.getGroupId());
@@ -390,6 +396,9 @@ public class TaskSerdeTest
         null,
         "foo",
         segments,
+        ImmutableList.<AggregatorFactory>of(
+            new CountAggregatorFactory("cnt")
+        ),
         indexSpec,
         null
     );
@@ -416,6 +425,7 @@ public class TaskSerdeTest
     Assert.assertEquals("foo", task3.getDataSource());
     Assert.assertEquals(new Interval("2010-01-01/P2D"), task3.getInterval());
     Assert.assertEquals(task3.getSegments(), segments);
+    Assert.assertEquals(task.getAggregators(), task2.getAggregators());
   }
 
   @Test

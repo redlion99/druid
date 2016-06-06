@@ -13,6 +13,7 @@ An example timeseries query object is shown below:
   "queryType": "timeseries",
   "dataSource": "sample_datasource",
   "granularity": "day",
+  "descending": "true",
   "filter": {
     "type": "and",
     "fields": [
@@ -34,8 +35,8 @@ An example timeseries query object is shown below:
       "name": "sample_divide",
       "fn": "/",
       "fields": [
-        { "type": "fieldAccess", "name": "sample_name1", "fieldName": "sample_fieldName1" },
-        { "type": "fieldAccess", "name": "sample_name2", "fieldName": "sample_fieldName2" }
+        { "type": "fieldAccess", "name": "postAgg__sample_name1", "fieldName": "sample_name1" },
+        { "type": "fieldAccess", "name": "postAgg__sample_name2", "fieldName": "sample_name2" }
       ]
     }
   ],
@@ -49,6 +50,7 @@ There are 7 main parts to a timeseries query:
 |--------|-----------|---------|
 |queryType|This String should always be "timeseries"; this is the first thing Druid looks at to figure out how to interpret the query|yes|
 |dataSource|A String or Object defining the data source to query, very similar to a table in a relational database. See [DataSource](../querying/datasource.html) for more information.|yes|
+|descending|Whether to make descending ordered result. Default is `false`(ascending).|no|
 |intervals|A JSON Object representing ISO-8601 Intervals. This defines the time ranges to run the query over.|yes|
 |granularity|Defines the granularity to bucket query results. See [Granularities](../querying/granularities.html)|yes|
 |filter|See [Filters](../querying/filters.html)|no|

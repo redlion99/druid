@@ -25,6 +25,8 @@ import io.druid.granularity.QueryGranularity;
 import io.druid.query.Result;
 import org.joda.time.DateTime;
 
+import java.util.List;
+
 /**
  */
 public class SelectBinaryFn
@@ -32,14 +34,17 @@ public class SelectBinaryFn
 {
   private final QueryGranularity gran;
   private final PagingSpec pagingSpec;
+  private final boolean descending;
 
   public SelectBinaryFn(
       QueryGranularity granularity,
-      PagingSpec pagingSpec
+      PagingSpec pagingSpec,
+      boolean descending
   )
   {
     this.gran = granularity;
     this.pagingSpec = pagingSpec;
+    this.descending = descending;
   }
 
   @Override
@@ -55,14 +60,22 @@ public class SelectBinaryFn
       return arg1;
     }
 
+    final List<EventHolder> arg1Val = arg1.getValue().getEvents();
+    final List<EventHolder> arg2Val = arg2.getValue().getEvents();
+
+    if (arg1Val == null || arg1Val.isEmpty()) {
+      return arg2;
+    }
+
+    if (arg2Val == null || arg2Val.isEmpty()) {
+      return arg1;
+    }
+
     final DateTime timestamp = (gran instanceof AllGranularity)
                                ? arg1.getTimestamp()
                                : gran.toDateTime(gran.truncate(arg1.getTimestamp().getMillis()));
 
-    SelectResultValueBuilder builder = new SelectResultValueBuilder(timestamp, pagingSpec.getThreshold());
-
-    SelectResultValue arg1Val = arg1.getValue();
-    SelectResultValue arg2Val = arg2.getValue();
+    SelectResultValueBuilder builder = new SelectResultValueBuilder.MergeBuilder(timestamp, pagingSpec, descending);
 
     for (EventHolder event : arg1Val) {
       builder.addEntry(event);

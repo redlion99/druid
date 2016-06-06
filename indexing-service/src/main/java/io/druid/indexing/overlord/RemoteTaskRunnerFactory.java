@@ -23,9 +23,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Supplier;
 import com.google.inject.Inject;
 import com.metamx.common.concurrent.ScheduledExecutorFactory;
+import com.metamx.common.logger.Logger;
 import com.metamx.http.client.HttpClient;
 import io.druid.curator.cache.SimplePathChildrenCacheFactory;
 import io.druid.guice.annotations.Global;
+import io.druid.indexing.overlord.autoscaling.NoopResourceManagementStrategy;
+import io.druid.indexing.overlord.autoscaling.ResourceManagementSchedulerConfig;
+import io.druid.indexing.overlord.autoscaling.ResourceManagementStrategy;
+import io.druid.indexing.overlord.autoscaling.SimpleWorkerResourceManagementConfig;
+import io.druid.indexing.overlord.autoscaling.SimpleWorkerResourceManagementStrategy;
 import io.druid.indexing.overlord.config.RemoteTaskRunnerConfig;
 import io.druid.indexing.overlord.setup.WorkerBehaviorConfig;
 import io.druid.server.initialization.IndexerZkConfig;
@@ -35,15 +41,18 @@ import java.util.concurrent.ScheduledExecutorService;
 
 /**
  */
-public class RemoteTaskRunnerFactory implements TaskRunnerFactory
+public class RemoteTaskRunnerFactory implements TaskRunnerFactory<RemoteTaskRunner>
 {
+  public static final String TYPE_NAME = "remote";
   private final CuratorFramework curator;
   private final RemoteTaskRunnerConfig remoteTaskRunnerConfig;
   private final IndexerZkConfig zkPaths;
   private final ObjectMapper jsonMapper;
   private final HttpClient httpClient;
   private final Supplier<WorkerBehaviorConfig> workerConfigRef;
-  private final ScheduledExecutorService cleanupExec;
+  private final ResourceManagementSchedulerConfig resourceManagementSchedulerConfig;
+  private final ResourceManagementStrategy resourceManagementStrategy;
+  private final ScheduledExecutorFactory factory;
 
   @Inject
   public RemoteTaskRunnerFactory(
@@ -53,7 +62,9 @@ public class RemoteTaskRunnerFactory implements TaskRunnerFactory
       final ObjectMapper jsonMapper,
       @Global final HttpClient httpClient,
       final Supplier<WorkerBehaviorConfig> workerConfigRef,
-      ScheduledExecutorFactory factory
+      final ScheduledExecutorFactory factory,
+      final ResourceManagementSchedulerConfig resourceManagementSchedulerConfig,
+      final ResourceManagementStrategy resourceManagementStrategy
   )
   {
     this.curator = curator;
@@ -62,11 +73,13 @@ public class RemoteTaskRunnerFactory implements TaskRunnerFactory
     this.jsonMapper = jsonMapper;
     this.httpClient = httpClient;
     this.workerConfigRef = workerConfigRef;
-    this.cleanupExec = factory.create(1,"RemoteTaskRunner-Scheduled-Cleanup--%d");
+    this.resourceManagementSchedulerConfig = resourceManagementSchedulerConfig;
+    this.resourceManagementStrategy = resourceManagementStrategy;
+    this.factory = factory;
   }
 
   @Override
-  public TaskRunner build()
+  public RemoteTaskRunner build()
   {
     return new RemoteTaskRunner(
         jsonMapper,
@@ -79,7 +92,10 @@ public class RemoteTaskRunnerFactory implements TaskRunnerFactory
             .build(),
         httpClient,
         workerConfigRef,
-        cleanupExec
+        factory.create(1, "RemoteTaskRunner-Scheduled-Cleanup--%d"),
+        resourceManagementSchedulerConfig.isDoAutoscale()
+        ? resourceManagementStrategy
+        : new NoopResourceManagementStrategy<>()
     );
   }
 }

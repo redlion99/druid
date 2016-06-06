@@ -28,7 +28,9 @@ import io.druid.query.extraction.ExtractionFn;
 import java.nio.ByteBuffer;
 
 /**
+ * This class is deprecated, use SelectorDimFilter instead: {@link io.druid.query.filter.SelectorDimFilter}
  */
+@Deprecated
 public class ExtractionDimFilter implements DimFilter
 {
   private final String dimension;
@@ -77,7 +79,7 @@ public class ExtractionDimFilter implements DimFilter
   public byte[] getCacheKey()
   {
     byte[] dimensionBytes = StringUtils.toUtf8(dimension);
-    byte[] valueBytes = StringUtils.toUtf8(value);
+    byte[] valueBytes = value == null ? new byte[0] : StringUtils.toUtf8(value);
     byte[] extractionFnBytes = extractionFn.getCacheKey();
     return ByteBuffer.allocate(3 + dimensionBytes.length + valueBytes.length + extractionFnBytes.length)
                      .put(DimFilterCacheHelper.EXTRACTION_CACHE_ID)
@@ -87,6 +89,18 @@ public class ExtractionDimFilter implements DimFilter
                      .put(DimFilterCacheHelper.STRING_SEPARATOR)
                      .put(extractionFnBytes)
                      .array();
+  }
+
+  @Override
+  public DimFilter optimize()
+  {
+    return new SelectorDimFilter(dimension, value, extractionFn).optimize();
+  }
+
+  @Override
+  public Filter toFilter()
+  {
+    return new SelectorDimFilter(dimension, value, extractionFn).toFilter();
   }
 
   @Override

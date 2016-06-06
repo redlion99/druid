@@ -88,7 +88,7 @@ public class GroupByQuery extends BaseQuery<Row>
       @JsonProperty("context") Map<String, Object> context
   )
   {
-    super(dataSource, querySegmentSpec, context);
+    super(dataSource, querySegmentSpec, false, context);
     this.dimFilter = dimFilter;
     this.granularity = granularity;
     this.dimensions = dimensions == null ? ImmutableList.<DimensionSpec>of() : dimensions;
@@ -152,7 +152,7 @@ public class GroupByQuery extends BaseQuery<Row>
       Map<String, Object> context
   )
   {
-    super(dataSource, querySegmentSpec, context);
+    super(dataSource, querySegmentSpec, false, context);
 
     this.dimFilter = dimFilter;
     this.granularity = granularity;
@@ -254,6 +254,23 @@ public class GroupByQuery extends BaseQuery<Row>
         postAggregatorSpecs,
         havingSpec,
         limitSpec,
+        limitFn,
+        getContext()
+    );
+  }
+
+  public GroupByQuery withDimFilter(final DimFilter dimFilter)
+  {
+    return new GroupByQuery(
+        getDataSource(),
+        getQuerySegmentSpec(),
+        dimFilter,
+        getGranularity(),
+        getDimensions(),
+        getAggregatorSpecs(),
+        getPostAggregatorSpecs(),
+        getHavingSpec(),
+        getLimitSpec(),
         limitFn,
         getContext()
     );
@@ -609,9 +626,6 @@ public class GroupByQuery extends BaseQuery<Row>
       return false;
     }
     if (limitSpec != null ? !limitSpec.equals(that.limitSpec) : that.limitSpec != null) {
-      return false;
-    }
-    if (limitFn != null ? !limitFn.equals(that.limitFn) : that.limitFn != null) {
       return false;
     }
     if (postAggregatorSpecs != null

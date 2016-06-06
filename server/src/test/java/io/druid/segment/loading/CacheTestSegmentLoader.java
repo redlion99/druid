@@ -20,20 +20,28 @@
 package io.druid.segment.loading;
 
 import com.metamx.common.MapUtils;
+
+import io.druid.segment.AbstractSegment;
 import io.druid.segment.QueryableIndex;
 import io.druid.segment.Segment;
 import io.druid.segment.StorageAdapter;
 import io.druid.timeline.DataSegment;
+
 import org.joda.time.Interval;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
 */
 public class CacheTestSegmentLoader implements SegmentLoader
 {
+
+  private final Set<DataSegment> segmentsInTrash = new HashSet<>();
+
   @Override
   public boolean isSegmentLoaded(DataSegment segment) throws SegmentLoadingException
   {
@@ -44,7 +52,7 @@ public class CacheTestSegmentLoader implements SegmentLoader
   @Override
   public Segment getSegment(final DataSegment segment) throws SegmentLoadingException
   {
-    return new Segment()
+    return new AbstractSegment()
     {
       @Override
       public String getIdentifier()
@@ -84,7 +92,13 @@ public class CacheTestSegmentLoader implements SegmentLoader
   }
 
   @Override
-  public void cleanup(DataSegment loadSpec) throws SegmentLoadingException
+  public void cleanup(DataSegment segment) throws SegmentLoadingException
   {
+    segmentsInTrash.add(segment);
+  }
+
+  public Set<DataSegment> getSegmentsInTrash()
+  {
+    return segmentsInTrash;
   }
 }

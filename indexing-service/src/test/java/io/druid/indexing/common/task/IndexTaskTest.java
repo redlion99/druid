@@ -27,18 +27,18 @@ import io.druid.data.input.impl.DimensionsSpec;
 import io.druid.data.input.impl.SpatialDimensionSchema;
 import io.druid.data.input.impl.StringInputRowParser;
 import io.druid.data.input.impl.TimestampSpec;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.indexing.common.TaskLock;
 import io.druid.indexing.common.TaskToolbox;
 import io.druid.indexing.common.TestUtils;
 import io.druid.indexing.common.actions.LockListAction;
 import io.druid.indexing.common.actions.TaskAction;
 import io.druid.indexing.common.actions.TaskActionClient;
-import io.druid.indexing.common.actions.TaskActionClientFactory;
 import io.druid.query.aggregation.AggregatorFactory;
 import io.druid.query.aggregation.LongSumAggregatorFactory;
 import io.druid.segment.IndexIO;
 import io.druid.segment.IndexMerger;
+import io.druid.segment.IndexMergerV9;
 import io.druid.segment.IndexSpec;
 import io.druid.segment.indexing.DataSchema;
 import io.druid.segment.indexing.RealtimeTuningConfig;
@@ -70,6 +70,7 @@ public class IndexTaskTest
   private final IndexSpec indexSpec;
   private final ObjectMapper jsonMapper;
   private IndexMerger indexMerger;
+  private IndexMergerV9 indexMergerV9;
   private IndexIO indexIO;
 
   public IndexTaskTest()
@@ -78,6 +79,7 @@ public class IndexTaskTest
     TestUtils testUtils = new TestUtils();
     jsonMapper = testUtils.getTestObjectMapper();
     indexMerger = testUtils.getTestIndexMerger();
+    indexMergerV9 = testUtils.getTestIndexMergerV9();
     indexIO = testUtils.getTestIndexIO();
   }
 
@@ -109,7 +111,7 @@ public class IndexTaskTest
                                 null
                             ),
                             new DimensionsSpec(
-                                Arrays.asList("ts"),
+                                DimensionsSpec.getDefaultSchemas(Arrays.asList("ts")),
                                 Lists.<String>newArrayList(),
                                 Lists.<SpatialDimensionSchema>newArrayList()
                             ),
@@ -124,7 +126,7 @@ public class IndexTaskTest
                 },
                 new UniformGranularitySpec(
                     Granularity.DAY,
-                    QueryGranularity.MINUTE,
+                    QueryGranularities.MINUTE,
                     Arrays.asList(new Interval("2014/2015"))
                 ),
                 jsonMapper
@@ -140,7 +142,8 @@ public class IndexTaskTest
                 2,
                 0,
                 null,
-                indexSpec
+                indexSpec,
+                null
             )
         ),
         jsonMapper,
@@ -180,7 +183,7 @@ public class IndexTaskTest
                                 null
                             ),
                             new DimensionsSpec(
-                                Arrays.asList("ts"),
+                                DimensionsSpec.getDefaultSchemas(Arrays.asList("ts")),
                                 Lists.<String>newArrayList(),
                                 Lists.<SpatialDimensionSchema>newArrayList()
                             ),
@@ -194,7 +197,7 @@ public class IndexTaskTest
                     new LongSumAggregatorFactory("val", "val")
                 },
                 new ArbitraryGranularitySpec(
-                    QueryGranularity.MINUTE,
+                    QueryGranularities.MINUTE,
                     Arrays.asList(new Interval("2014/2015"))
                 ),
                 jsonMapper
@@ -252,7 +255,7 @@ public class IndexTaskTest
             return segment;
           }
         }, null, null, null, null, null, null, null, null, null, null, temporaryFolder.newFolder(),
-            indexMerger, indexIO, null, null
+            indexMerger, indexIO, null, null, indexMergerV9
         )
     );
 
@@ -286,7 +289,7 @@ public class IndexTaskTest
                                 null
                             ),
                             new DimensionsSpec(
-                                Arrays.asList("dim"),
+                                DimensionsSpec.getDefaultSchemas(Arrays.asList("dim")),
                                 Lists.<String>newArrayList(),
                                 Lists.<SpatialDimensionSchema>newArrayList()
                             ),
@@ -301,7 +304,7 @@ public class IndexTaskTest
                 },
                 new UniformGranularitySpec(
                     Granularity.HOUR,
-                    QueryGranularity.HOUR,
+                    QueryGranularities.HOUR,
                     Arrays.asList(new Interval("2015-03-01T08:00:00Z/2015-03-01T09:00:00Z"))
                 ),
                 jsonMapper
@@ -332,12 +335,14 @@ public class IndexTaskTest
         100,
         1000,
         null,
-        new IndexSpec()
+        new IndexSpec(),
+        null
     );
     RealtimeTuningConfig realtimeTuningConfig = IndexTask.convertTuningConfig(
         spec,
         config.getRowFlushBoundary(),
-        config.getIndexSpec()
+        config.getIndexSpec(),
+        config.getBuildV9Directly()
     );
     Assert.assertEquals(realtimeTuningConfig.getMaxRowsInMemory(), config.getRowFlushBoundary());
     Assert.assertEquals(realtimeTuningConfig.getShardSpec(), spec);

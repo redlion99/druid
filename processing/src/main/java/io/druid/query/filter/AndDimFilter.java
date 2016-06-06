@@ -23,8 +23,10 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import io.druid.query.Druids;
+import io.druid.segment.filter.AndFilter;
+import io.druid.segment.filter.Filters;
 
-import java.util.Collections;
 import java.util.List;
 
 /**
@@ -40,7 +42,7 @@ public class AndDimFilter implements DimFilter
       @JsonProperty("fields") List<DimFilter> fields
   )
   {
-    fields.removeAll(Collections.singletonList(null));
+    fields = DimFilters.filterNulls(fields);
     Preconditions.checkArgument(fields.size() > 0, "AND operator requires at least one field");
     this.fields = fields;
   }
@@ -55,6 +57,19 @@ public class AndDimFilter implements DimFilter
   public byte[] getCacheKey()
   {
     return DimFilterCacheHelper.computeCacheKey(DimFilterCacheHelper.AND_CACHE_ID, fields);
+  }
+
+  @Override
+  public DimFilter optimize()
+  {
+    List<DimFilter> elements = DimFilters.optimize(fields);
+    return elements.size() == 1 ? elements.get(0) : Druids.newAndDimFilterBuilder().fields(elements).build();
+  }
+
+  @Override
+  public Filter toFilter()
+  {
+    return new AndFilter(Filters.toFilters(fields));
   }
 
   @Override

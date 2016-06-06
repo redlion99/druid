@@ -21,6 +21,7 @@ package io.druid.segment.realtime.plumber;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Suppliers;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.io.Files;
@@ -35,7 +36,7 @@ import io.druid.data.input.impl.DimensionsSpec;
 import io.druid.data.input.impl.JSONParseSpec;
 import io.druid.data.input.impl.StringInputRowParser;
 import io.druid.data.input.impl.TimestampSpec;
-import io.druid.granularity.QueryGranularity;
+import io.druid.granularity.QueryGranularities;
 import io.druid.jackson.DefaultObjectMapper;
 import io.druid.query.DefaultQueryRunnerFactoryConglomerate;
 import io.druid.query.Query;
@@ -43,6 +44,7 @@ import io.druid.query.QueryRunnerFactory;
 import io.druid.query.SegmentDescriptor;
 import io.druid.query.aggregation.AggregatorFactory;
 import io.druid.query.aggregation.CountAggregatorFactory;
+import io.druid.segment.QueryableIndex;
 import io.druid.segment.TestHelper;
 import io.druid.segment.indexing.DataSchema;
 import io.druid.segment.indexing.RealtimeTuningConfig;
@@ -68,13 +70,12 @@ import org.junit.runners.Parameterized;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  */
@@ -82,6 +83,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class RealtimePlumberSchoolTest
 {
   private final RejectionPolicyFactory rejectionPolicy;
+  private final boolean buildV9Directly;
   private RealtimePlumber plumber;
   private RealtimePlumberSchool realtimePlumberSchool;
   private DataSegmentAnnouncer announcer;
@@ -95,24 +97,28 @@ public class RealtimePlumberSchoolTest
   private DataSchema schema2;
   private FireDepartmentMetrics metrics;
 
-  public RealtimePlumberSchoolTest(RejectionPolicyFactory rejectionPolicy)
+  public RealtimePlumberSchoolTest(RejectionPolicyFactory rejectionPolicy, boolean buildV9Directly)
   {
     this.rejectionPolicy = rejectionPolicy;
+    this.buildV9Directly = buildV9Directly;
   }
 
-  @Parameterized.Parameters
+  @Parameterized.Parameters(name = "rejectionPolicy = {0}, buildV9Directly = {1}")
   public static Collection<?> constructorFeeder() throws IOException
   {
-    return Arrays.asList(
-        new Object[][]{
-            {
-                new NoopRejectionPolicyFactory()
-            },
-            {
-                new MessageTimeRejectionPolicyFactory()
-            }
-        }
-    );
+    final RejectionPolicyFactory[] rejectionPolicies = new RejectionPolicyFactory[]{
+        new NoopRejectionPolicyFactory(),
+        new MessageTimeRejectionPolicyFactory()
+    };
+    final boolean[] buildV9Directlies = new boolean[]{true, false};
+
+    final List<Object[]> constructors = Lists.newArrayList();
+    for (RejectionPolicyFactory rejectionPolicy : rejectionPolicies) {
+      for (boolean buildV9Directly : buildV9Directlies) {
+        constructors.add(new Object[]{rejectionPolicy, buildV9Directly});
+      }
+    }
+    return constructors;
   }
 
   @Before
@@ -135,7 +141,7 @@ public class RealtimePlumberSchoolTest
             Map.class
         ),
         new AggregatorFactory[]{new CountAggregatorFactory("rows")},
-        new UniformGranularitySpec(Granularity.HOUR, QueryGranularity.NONE, null),
+        new UniformGranularitySpec(Granularity.HOUR, QueryGranularities.NONE, null),
         jsonMapper
     );
 
@@ -151,7 +157,7 @@ public class RealtimePlumberSchoolTest
             Map.class
         ),
         new AggregatorFactory[]{new CountAggregatorFactory("rows")},
-        new UniformGranularitySpec(Granularity.YEAR, QueryGranularity.NONE, null),
+        new UniformGranularitySpec(Granularity.YEAR, QueryGranularities.NONE, null),
         jsonMapper
     );
 
@@ -163,7 +169,9 @@ public class RealtimePlumberSchoolTest
     dataSegmentPusher = EasyMock.createNiceMock(DataSegmentPusher.class);
     handoffNotifierFactory = EasyMock.createNiceMock(SegmentHandoffNotifierFactory.class);
     handoffNotifier = EasyMock.createNiceMock(SegmentHandoffNotifier.class);
-    EasyMock.expect(handoffNotifierFactory.createSegmentHandoffNotifier(EasyMock.anyString())).andReturn(handoffNotifier).anyTimes();
+    EasyMock.expect(handoffNotifierFactory.createSegmentHandoffNotifier(EasyMock.anyString()))
+            .andReturn(handoffNotifier)
+            .anyTimes();
     EasyMock.expect(
         handoffNotifier.registerSegmentHandoffCallback(
             EasyMock.<SegmentDescriptor>anyObject(),
@@ -185,6 +193,11 @@ public class RealtimePlumberSchoolTest
         rejectionPolicy,
         null,
         null,
+        null,
+        buildV9Directly,
+        0,
+        0,
+        false,
         null
     );
 
@@ -197,6 +210,7 @@ public class RealtimePlumberSchoolTest
         handoffNotifierFactory,
         MoreExecutors.sameThreadExecutor(),
         TestHelper.getTestIndexMerger(),
+        TestHelper.getTestIndexMergerV9(),
         TestHelper.getTestIndexIO(),
         MapCache.create(0),
         FireDepartmentTest.NO_CACHE_CONFIG,
@@ -210,7 +224,7 @@ public class RealtimePlumberSchoolTest
   @After
   public void tearDown() throws Exception
   {
-    EasyMock.verify(announcer, segmentPublisher, dataSegmentPusher,handoffNotifierFactory, handoffNotifier, emitter);
+    EasyMock.verify(announcer, segmentPublisher, dataSegmentPusher, handoffNotifierFactory, handoffNotifier, emitter);
     FileUtils.deleteDirectory(
         new File(
             tuningConfig.getBasePersistDirectory(),
@@ -237,15 +251,16 @@ public class RealtimePlumberSchoolTest
 
   private void testPersist(final Object commitMetadata) throws Exception
   {
-    final AtomicBoolean committed = new AtomicBoolean(false);
     plumber.getSinks()
            .put(
                0L,
                new Sink(
                    new Interval(0, TimeUnit.HOURS.toMillis(1)),
                    schema,
-                   tuningConfig,
-                   new DateTime("2014-12-01T12:34:56.789").toString()
+                   tuningConfig.getShardSpec(),
+                   new DateTime("2014-12-01T12:34:56.789").toString(),
+                   tuningConfig.getMaxRowsInMemory(),
+                   tuningConfig.isReportParseExceptions()
                )
            );
     Assert.assertNull(plumber.startJob());
@@ -254,6 +269,9 @@ public class RealtimePlumberSchoolTest
     EasyMock.expect(row.getTimestampFromEpoch()).andReturn(0L);
     EasyMock.expect(row.getDimensions()).andReturn(new ArrayList<String>());
     EasyMock.replay(row);
+
+    final CountDownLatch doneSignal = new CountDownLatch(1);
+
     final Committer committer = new Committer()
     {
       @Override
@@ -265,15 +283,14 @@ public class RealtimePlumberSchoolTest
       @Override
       public void run()
       {
-        committed.set(true);
+        doneSignal.countDown();
       }
     };
     plumber.add(row, Suppliers.ofInstance(committer));
     plumber.persist(committer);
 
-    while (!committed.get()) {
-      Thread.sleep(100);
-    }
+    doneSignal.await();
+
     plumber.getSinks().clear();
     plumber.finishJob();
   }
@@ -281,15 +298,16 @@ public class RealtimePlumberSchoolTest
   @Test(timeout = 60000)
   public void testPersistFails() throws Exception
   {
-    final AtomicBoolean committed = new AtomicBoolean(false);
     plumber.getSinks()
            .put(
                0L,
                new Sink(
                    new Interval(0, TimeUnit.HOURS.toMillis(1)),
                    schema,
-                   tuningConfig,
-                   new DateTime("2014-12-01T12:34:56.789").toString()
+                   tuningConfig.getShardSpec(),
+                   new DateTime("2014-12-01T12:34:56.789").toString(),
+                   tuningConfig.getMaxRowsInMemory(),
+                   tuningConfig.isReportParseExceptions()
                )
            );
     plumber.startJob();
@@ -297,7 +315,10 @@ public class RealtimePlumberSchoolTest
     EasyMock.expect(row.getTimestampFromEpoch()).andReturn(0L);
     EasyMock.expect(row.getDimensions()).andReturn(new ArrayList<String>());
     EasyMock.replay(row);
-    plumber.add(row, Committers.supplierOf(Committers.nil()));
+    plumber.add(row, Suppliers.ofInstance(Committers.nil()));
+
+    final CountDownLatch doneSignal = new CountDownLatch(1);
+
     plumber.persist(
         Committers.supplierFromRunnable(
             new Runnable()
@@ -305,15 +326,14 @@ public class RealtimePlumberSchoolTest
               @Override
               public void run()
               {
-                committed.set(true);
+                doneSignal.countDown();
                 throw new RuntimeException();
               }
             }
         ).get()
     );
-    while (!committed.get()) {
-      Thread.sleep(100);
-    }
+
+    doneSignal.await();
 
     // Exception may need time to propagate
     while (metrics.failedPersists() < 1) {
@@ -332,7 +352,6 @@ public class RealtimePlumberSchoolTest
 
   private void testPersistHydrantGapsHelper(final Object commitMetadata) throws Exception
   {
-    final AtomicBoolean committed = new AtomicBoolean(false);
     Interval testInterval = new Interval(new DateTime("1970-01-01"), new DateTime("1971-01-01"));
 
     RealtimePlumber plumber2 = (RealtimePlumber) realtimePlumberSchool.findPlumber(schema2, tuningConfig, metrics);
@@ -342,12 +361,14 @@ public class RealtimePlumberSchoolTest
                 new Sink(
                     testInterval,
                     schema2,
-                    tuningConfig,
-                    new DateTime("2014-12-01T12:34:56.789").toString()
+                    tuningConfig.getShardSpec(),
+                    new DateTime("2014-12-01T12:34:56.789").toString(),
+                    tuningConfig.getMaxRowsInMemory(),
+                    tuningConfig.isReportParseExceptions()
                 )
             );
     Assert.assertNull(plumber2.startJob());
-
+    final CountDownLatch doneSignal = new CountDownLatch(1);
     final Committer committer = new Committer()
     {
       @Override
@@ -359,7 +380,7 @@ public class RealtimePlumberSchoolTest
       @Override
       public void run()
       {
-        committed.set(true);
+        doneSignal.countDown();
       }
     };
     plumber2.add(getTestInputRow("1970-01-01"), Suppliers.ofInstance(committer));
@@ -370,9 +391,7 @@ public class RealtimePlumberSchoolTest
 
     plumber2.persist(committer);
 
-    while (!committed.get()) {
-      Thread.sleep(100);
-    }
+    doneSignal.await();
     plumber2.getSinks().clear();
     plumber2.finishJob();
 
@@ -430,6 +449,123 @@ public class RealtimePlumberSchoolTest
     Assert.assertEquals(0, restoredPlumber2.getSinks().size());
   }
 
+  @Test(timeout = 60000)
+  public void testDimOrderInheritance() throws Exception
+  {
+    final Object commitMetadata = "dummyCommitMetadata";
+    testDimOrderInheritanceHelper(commitMetadata);
+  }
+
+  private void testDimOrderInheritanceHelper(final Object commitMetadata) throws Exception
+  {
+    List<List<String>> expectedDims = ImmutableList.<List<String>>of(
+        ImmutableList.of("dimD"),
+        ImmutableList.of("dimC"),
+        ImmutableList.of("dimA"),
+        ImmutableList.of("dimB"),
+        ImmutableList.of("dimE"),
+        ImmutableList.of("dimD", "dimC", "dimA", "dimB", "dimE")
+    );
+
+    QueryableIndex qindex;
+    FireHydrant hydrant;
+    Map<Long, Sink> sinks;
+
+    RealtimePlumber plumber = (RealtimePlumber) realtimePlumberSchool.findPlumber(schema2, tuningConfig, metrics);
+    Assert.assertNull(plumber.startJob());
+
+    final CountDownLatch doneSignal = new CountDownLatch(1);
+
+    final Committer committer = new Committer()
+    {
+      @Override
+      public Object getMetadata()
+      {
+        return commitMetadata;
+      }
+
+      @Override
+      public void run()
+      {
+        doneSignal.countDown();
+      }
+    };
+
+    plumber.add(
+        getTestInputRowFull(
+            "1970-01-01",
+            ImmutableList.of("dimD"),
+            ImmutableList.of("1")
+        ),
+        Suppliers.ofInstance(committer)
+    );
+    plumber.add(
+        getTestInputRowFull(
+            "1970-01-01",
+            ImmutableList.of("dimC"),
+            ImmutableList.of("1")
+        ),
+        Suppliers.ofInstance(committer)
+    );
+    plumber.add(
+        getTestInputRowFull(
+            "1970-01-01",
+            ImmutableList.of("dimA"),
+            ImmutableList.of("1")
+        ),
+        Suppliers.ofInstance(committer)
+    );
+    plumber.add(
+        getTestInputRowFull(
+            "1970-01-01",
+            ImmutableList.of("dimB"),
+            ImmutableList.of("1")
+        ),
+        Suppliers.ofInstance(committer)
+    );
+    plumber.add(
+        getTestInputRowFull(
+            "1970-01-01",
+            ImmutableList.of("dimE"),
+            ImmutableList.of("1")
+        ),
+        Suppliers.ofInstance(committer)
+    );
+    plumber.add(
+        getTestInputRowFull(
+            "1970-01-01",
+            ImmutableList.of("dimA", "dimB", "dimC", "dimD", "dimE"),
+            ImmutableList.of("1")
+        ),
+        Suppliers.ofInstance(committer)
+    );
+
+    plumber.persist(committer);
+
+    doneSignal.await();
+
+    plumber.getSinks().clear();
+    plumber.finishJob();
+
+    RealtimePlumber restoredPlumber = (RealtimePlumber) realtimePlumberSchool.findPlumber(
+        schema2,
+        tuningConfig,
+        metrics
+    );
+    restoredPlumber.bootstrapSinksFromDisk();
+
+    sinks = restoredPlumber.getSinks();
+    Assert.assertEquals(1, sinks.size());
+    List<FireHydrant> hydrants = Lists.newArrayList(sinks.get(0L));
+
+    for (int i = 0; i < hydrants.size(); i++) {
+      hydrant = hydrants.get(i);
+      qindex = hydrant.getSegment().asQueryableIndex();
+      Assert.assertEquals(i, hydrant.getCount());
+      Assert.assertEquals(expectedDims.get(i), ImmutableList.copyOf(qindex.getAvailableDimensions()));
+    }
+  }
+
   private InputRow getTestInputRow(final String timeStr)
   {
     return new InputRow()
@@ -474,6 +610,60 @@ public class RealtimePlumberSchoolTest
       public Object getRaw(String dimension)
       {
         return null;
+      }
+
+      @Override
+      public int compareTo(Row o)
+      {
+        return 0;
+      }
+    };
+  }
+
+  private InputRow getTestInputRowFull(final String timeStr, final List<String> dims, final List<String> dimVals)
+  {
+    return new InputRow()
+    {
+      @Override
+      public List<String> getDimensions()
+      {
+        return dims;
+      }
+
+      @Override
+      public long getTimestampFromEpoch()
+      {
+        return new DateTime(timeStr).getMillis();
+      }
+
+      @Override
+      public DateTime getTimestamp()
+      {
+        return new DateTime(timeStr);
+      }
+
+      @Override
+      public List<String> getDimension(String dimension)
+      {
+        return dimVals;
+      }
+
+      @Override
+      public float getFloatMetric(String metric)
+      {
+        return 0;
+      }
+
+      @Override
+      public long getLongMetric(String metric)
+      {
+        return 0L;
+      }
+
+      @Override
+      public Object getRaw(String dimension)
+      {
+        return dimVals;
       }
 
       @Override

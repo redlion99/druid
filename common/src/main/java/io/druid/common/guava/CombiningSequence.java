@@ -19,7 +19,6 @@
 
 package io.druid.common.guava;
 
-import com.google.common.base.Function;
 import com.google.common.collect.Ordering;
 import com.metamx.common.guava.Accumulator;
 import com.metamx.common.guava.Sequence;
@@ -38,29 +37,25 @@ public class CombiningSequence<T> implements Sequence<T>
   public static <T> CombiningSequence<T> create(
       Sequence<T> baseSequence,
       Ordering<T> ordering,
-      BinaryFn<T, T, T> mergeFn,
-      Function transformFn
+      BinaryFn<T, T, T> mergeFn
   )
   {
-    return new CombiningSequence<T>(baseSequence, ordering, mergeFn, transformFn);
+    return new CombiningSequence<T>(baseSequence, ordering, mergeFn);
   }
 
   private final Sequence<T> baseSequence;
   private final Ordering<T> ordering;
   private final BinaryFn<T, T, T> mergeFn;
-  private final Function transformFn;
 
   public CombiningSequence(
       Sequence<T> baseSequence,
       Ordering<T> ordering,
-      BinaryFn<T, T, T> mergeFn,
-      Function transformFn
+      BinaryFn<T, T, T> mergeFn
   )
   {
     this.baseSequence = baseSequence;
     this.ordering = ordering;
     this.mergeFn = mergeFn;
-    this.transformFn = transformFn;
   }
 
   @Override
@@ -85,8 +80,8 @@ public class CombiningSequence<T> implements Sequence<T>
     return makeYielder(baseYielder, combiningAccumulator, false);
   }
 
-  public <OutType, T> Yielder<OutType> makeYielder(
-      Yielder<T> yielder,
+  public <OutType> Yielder<OutType> makeYielder(
+      final Yielder<T> yielder,
       final CombiningYieldingAccumulator<OutType, T> combiningAccumulator,
       boolean finalValue
   )
@@ -97,7 +92,7 @@ public class CombiningSequence<T> implements Sequence<T>
 
     if(!yielder.isDone()) {
       retVal = combiningAccumulator.getRetVal();
-      finalYielder = yielder.next(yielder.get());
+      finalYielder = null;
       finalFinalValue = false;
     } else {
       if(!finalValue && combiningAccumulator.accumulatedSomething()) {
@@ -106,13 +101,13 @@ public class CombiningSequence<T> implements Sequence<T>
         finalFinalValue = true;
 
         if(!combiningAccumulator.yielded()) {
-          return Yielders.done(null, yielder);
+          return Yielders.done(retVal, yielder);
         } else {
           finalYielder = Yielders.done(null, yielder);
         }
       }
       else {
-        return Yielders.done(null, yielder);
+        return Yielders.done(combiningAccumulator.getRetVal(), yielder);
       }
     }
 
@@ -122,16 +117,18 @@ public class CombiningSequence<T> implements Sequence<T>
       @Override
       public OutType get()
       {
-        if (transformFn != null) {
-          return (OutType) transformFn.apply(retVal);
-        }
         return retVal;
       }
 
       @Override
       public Yielder<OutType> next(OutType initValue)
       {
-        return makeYielder(finalYielder, combiningAccumulator, finalFinalValue);
+        combiningAccumulator.reset();
+        return makeYielder(
+            finalYielder == null ? yielder.next(yielder.get()) : finalYielder,
+            combiningAccumulator,
+            finalFinalValue
+        );
       }
 
       @Override
@@ -143,7 +140,7 @@ public class CombiningSequence<T> implements Sequence<T>
       @Override
       public void close() throws IOException
       {
-        finalYielder.close();
+        yielder.close();
       }
     };
   }

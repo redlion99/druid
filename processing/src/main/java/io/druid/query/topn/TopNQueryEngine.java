@@ -64,7 +64,7 @@ public class TopNQueryEngine
     }
 
     final List<Interval> queryIntervals = query.getQuerySegmentSpec().getIntervals();
-    final Filter filter = Filters.convertDimensionFilters(query.getDimensionsFilter());
+    final Filter filter = Filters.toFilter(query.getDimensionsFilter());
     final QueryGranularity granularity = query.getGranularity();
     final Function<Cursor, Result<TopNResultValue>> mapFn = getMapFn(query, adapter);
 
@@ -74,7 +74,7 @@ public class TopNQueryEngine
 
     return Sequences.filter(
         Sequences.map(
-            adapter.makeCursors(filter, queryIntervals.get(0), granularity),
+            adapter.makeCursors(filter, queryIntervals.get(0), granularity, query.isDescending()),
             new Function<Cursor, Result<TopNResultValue>>()
             {
               @Override
@@ -119,7 +119,7 @@ public class TopNQueryEngine
       topNAlgorithm = new DimExtractionTopNAlgorithm(capabilities, query);
     } else if (selector.isAggregateAllMetrics()) {
       topNAlgorithm = new PooledTopNAlgorithm(capabilities, query, bufferPool);
-    } else if (selector.isAggregateTopNMetricFirst() || query.getContextValue("doAggregateTopNMetricFirst", false)) {
+    } else if (selector.isAggregateTopNMetricFirst() || query.getContextBoolean("doAggregateTopNMetricFirst", false)) {
       topNAlgorithm = new AggregateTopNMetricFirstAlgorithm(capabilities, query, bufferPool);
     } else {
       topNAlgorithm = new PooledTopNAlgorithm(capabilities, query, bufferPool);

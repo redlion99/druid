@@ -22,6 +22,8 @@ package io.druid.query.filter;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Preconditions;
+import io.druid.query.Druids;
+import io.druid.segment.filter.NotFilter;
 
 import java.nio.ByteBuffer;
 
@@ -52,6 +54,18 @@ public class NotDimFilter implements DimFilter
     byte[] subKey = field.getCacheKey();
 
     return ByteBuffer.allocate(1 + subKey.length).put(DimFilterCacheHelper.NOT_CACHE_ID).put(subKey).array();
+  }
+
+  @Override
+  public DimFilter optimize()
+  {
+    return Druids.newNotDimFilterBuilder().field(this.getField().optimize()).build();
+  }
+
+  @Override
+  public Filter toFilter()
+  {
+    return new NotFilter(field.toFilter());
   }
 
   @Override
