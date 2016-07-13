@@ -104,6 +104,7 @@
         <module>extensions-contrib/distinctcount</module>
         <module>extensions-contrib/parquet-extensions</module>
         <module>extensions-contrib/statsd-emitter</module>
+        <module>extensions-contrib/ali-oss-extensions</module>
 
         <!-- distribution packaging -->
         <module>distribution</module>
