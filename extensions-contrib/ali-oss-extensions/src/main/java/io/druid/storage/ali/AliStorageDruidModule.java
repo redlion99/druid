@@ -2,9 +2,13 @@ package io.druid.storage.ali;
 
 import com.fasterxml.jackson.core.Version;
 import com.fasterxml.jackson.databind.Module;
+import com.fasterxml.jackson.databind.jsontype.NamedType;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 import com.google.common.collect.ImmutableList;
 import com.google.inject.Binder;
 import com.google.inject.Key;
+import com.google.inject.Provides;
+import io.druid.firehose.ali.StaticAliOssFirehoseFactory;
 import io.druid.guice.Binders;
 import io.druid.guice.JsonConfigProvider;
 import io.druid.guice.LazySingleton;
@@ -37,7 +41,9 @@ public class AliStorageDruidModule  implements DruidModule{
                     public void setupModule(SetupContext context) {
                         context.registerSubtypes(AliLoadSpec.class);
                     }
-                }
+                },
+                new SimpleModule().registerSubtypes(
+                        new NamedType(StaticAliOssFirehoseFactory.class, "static-ali-oss-store"))
         );
     }
 
@@ -53,5 +59,14 @@ public class AliStorageDruidModule  implements DruidModule{
                 .to(AliDataSegmentPusher.class)
                 .in(LazySingleton.class);
         JsonConfigProvider.bind(binder, "druid.storage", AliDataSegmentConfig.class);
+    }
+
+    @Provides
+    @LazySingleton
+    public AliStorage getAliStorage(
+            final AliDataSegmentConfig config
+    )
+    {
+        return new AliStorage(config);
     }
 }
