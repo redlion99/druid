@@ -23,7 +23,7 @@ public class AliStorage {
     public InputStream openStream(String file_name){
 
         OSSObject ossObject = this.client.getObject(this.config.getBucket(), file_name);
-        log.info("read oss object from ali oss : file_name -- [%s], content length -- [%s]", file_name,  ossObject.getObjectMetadata().getContentLength());
+        log.info("read oss object from ali oss : file_name -- [%s], content length -- [%d]", file_name,  ossObject.getObjectMetadata().getContentLength());
         return ossObject.getObjectContent();
     }
 }
