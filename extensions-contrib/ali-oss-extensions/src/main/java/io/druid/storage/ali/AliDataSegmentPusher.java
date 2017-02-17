@@ -35,6 +35,11 @@ public class AliDataSegmentPusher extends AliStorage implements DataSegmentPushe
     }
 
     @Override
+    public String getPathForHadoop() {
+        return null;
+    }
+
+    @Override
     public DataSegment push(File indexFilesDir, DataSegment segment) throws IOException {
         final String storageDir = DataSegmentPusherUtil.getHdfsStorageDir(segment);
         String indexPath = String.format("%s/%s/index.zip", config.getStorageDirectory(), storageDir);
