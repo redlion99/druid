@@ -91,6 +91,7 @@ public class HadoopDruidIndexerConfig
   public static final IndexIO INDEX_IO;
   public static final IndexMerger INDEX_MERGER;
   public static final IndexMergerV9 INDEX_MERGER_V9;
+  public static final HadoopKerberosConfig HADOOP_KERBEROS_CONFIG;
 
   private static final String DEFAULT_WORKING_PATH = "/tmp/druid-indexing";
 
@@ -106,6 +107,7 @@ public class HadoopDruidIndexerConfig
                 JsonConfigProvider.bindInstance(
                     binder, Key.get(DruidNode.class, Self.class), new DruidNode("hadoop-indexer", null, null)
                 );
+                JsonConfigProvider.bind(binder, "druid.hadoop.security.kerberos", HadoopKerberosConfig.class);
               }
             },
             new IndexingHadoopModule()
@@ -115,6 +117,7 @@ public class HadoopDruidIndexerConfig
     INDEX_IO = injector.getInstance(IndexIO.class);
     INDEX_MERGER = injector.getInstance(IndexMerger.class);
     INDEX_MERGER_V9 = injector.getInstance(IndexMergerV9.class);
+    HADOOP_KERBEROS_CONFIG = injector.getInstance(HadoopKerberosConfig.class);
   }
 
   public static enum IndexJobCounters
@@ -333,6 +336,11 @@ public class HadoopDruidIndexerConfig
     return schema.getTuningConfig().getPartitionsSpec().getTargetPartitionSize();
   }
 
+  public boolean isForceExtendableShardSpecs()
+  {
+    return schema.getTuningConfig().isForceExtendableShardSpecs();
+  }
+
   public long getMaxPartitionSize()
   {
     return schema.getTuningConfig().getPartitionsSpec().getMaxPartitionSize();
@@ -356,6 +364,11 @@ public class HadoopDruidIndexerConfig
   public HadoopyShardSpec getShardSpec(Bucket bucket)
   {
     return schema.getTuningConfig().getShardSpecs().get(bucket.time).get(bucket.partitionNum);
+  }
+
+  public int getShardSpecCount(Bucket bucket)
+  {
+    return schema.getTuningConfig().getShardSpecs().get(bucket.time).size();
   }
 
   public boolean isBuildV9Directly()
@@ -487,7 +500,7 @@ public class HadoopDruidIndexerConfig
   {
     return new Path(
         String.format(
-            "%s/%s/%s/%s",
+            "%s/%s/%s_%s",
             getWorkingPath(),
             schema.getDataSchema().getDataSource(),
             schema.getTuningConfig().getVersion().replace(":", ""),

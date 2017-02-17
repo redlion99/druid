@@ -48,7 +48,7 @@ public class OffHeapNamespaceExtractionCacheManager extends NamespaceExtractionC
   private static final Logger log = new Logger(OffHeapNamespaceExtractionCacheManager.class);
   private final DB mmapDB;
   private ConcurrentMap<String, String> currentNamespaceCache = new ConcurrentHashMap<>();
-  private Striped<Lock> nsLocks = Striped.lock(32); // Needed to make sure delete() doesn't do weird things
+  private Striped<Lock> nsLocks = Striped.lazyWeakLock(1024); // Needed to make sure delete() doesn't do weird things
   private final File tmpFile;
 
   @Inject
@@ -133,22 +133,21 @@ public class OffHeapNamespaceExtractionCacheManager extends NamespaceExtractionC
   @Override
   public boolean delete(final String namespaceKey)
   {
+    // `super.delete` has a synchronization in it, don't call it in the lock.
+    if (!super.delete(namespaceKey)) {
+      return false;
+    }
     final Lock lock = nsLocks.get(namespaceKey);
     lock.lock();
     try {
-      if (super.delete(namespaceKey)) {
-        final String mmapDBkey = currentNamespaceCache.get(namespaceKey);
-        if (mmapDBkey != null) {
-          final long pre = tmpFile.length();
-          mmapDB.delete(mmapDBkey);
-          log.debug("MapDB file size: pre %d  post %d", pre, tmpFile.length());
-          return true;
-        } else {
-          return false;
-        }
-      } else {
+      final String mmapDBkey = currentNamespaceCache.remove(namespaceKey);
+      if (mmapDBkey == null) {
         return false;
       }
+      final long pre = tmpFile.length();
+      mmapDB.delete(mmapDBkey);
+      log.debug("MapDB file size: pre %d  post %d", pre, tmpFile.length());
+      return true;
     }
     finally {
       lock.unlock();
@@ -156,27 +155,17 @@ public class OffHeapNamespaceExtractionCacheManager extends NamespaceExtractionC
   }
 
   @Override
-  public ConcurrentMap<String, String> getCacheMap(String namespaceOrCacheKey)
+  public ConcurrentMap<String, String> getCacheMap(String namespaceKey)
   {
-    final Lock lock = nsLocks.get(namespaceOrCacheKey);
+    final Lock lock = nsLocks.get(namespaceKey);
     lock.lock();
     try {
-      String realKey = currentNamespaceCache.get(namespaceOrCacheKey);
-      if (realKey == null) {
-        realKey = namespaceOrCacheKey;
+      String mapDBKey = currentNamespaceCache.get(namespaceKey);
+      if (mapDBKey == null) {
+        // Not something created by swapAndClearCache
+        mapDBKey = namespaceKey;
       }
-      final Lock nsLock = nsLocks.get(realKey);
-      if (lock != nsLock) {
-        nsLock.lock();
-      }
-      try {
-        return mmapDB.createHashMap(realKey).makeOrGet();
-      }
-      finally {
-        if (lock != nsLock) {
-          nsLock.unlock();
-        }
-      }
+      return mmapDB.createHashMap(mapDBKey).makeOrGet();
     }
     finally {
       lock.unlock();

@@ -36,6 +36,8 @@ import io.druid.query.aggregation.AggregatorFactory;
 import io.druid.query.aggregation.CountAggregatorFactory;
 import io.druid.query.aggregation.DoubleSumAggregatorFactory;
 import io.druid.segment.IndexSpec;
+import io.druid.segment.data.CompressedObjectStrategy;
+import io.druid.segment.data.CompressionFactory;
 import io.druid.segment.data.RoaringBitmapSerdeFactory;
 import io.druid.segment.indexing.DataSchema;
 import io.druid.segment.indexing.RealtimeIOConfig;
@@ -91,7 +93,7 @@ public class TaskSerdeTest
                 jsonMapper
             ),
             new IndexTask.IndexIOConfig(new LocalFirehoseFactory(new File("lol"), "rofl", null)),
-            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec, null)
+            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec, null, false)
         ),
         jsonMapper,
         null
@@ -132,7 +134,7 @@ public class TaskSerdeTest
                 jsonMapper
             ),
             new IndexTask.IndexIOConfig(new LocalFirehoseFactory(new File("lol"), "rofl", null)),
-            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec, null)
+            new IndexTask.IndexTuningConfig(10000, 10, -1, indexSpec, null, false)
         ),
         jsonMapper,
         null
@@ -176,6 +178,7 @@ public class TaskSerdeTest
         "foo",
         segments,
         aggregators,
+        true,
         indexSpec,
         null
     );
@@ -331,7 +334,7 @@ public class TaskSerdeTest
                 null,
                 null,
                 1,
-                new NoneShardSpec(),
+                NoneShardSpec.instance(),
                 indexSpec,
                 null,
                 0,
@@ -487,7 +490,7 @@ public class TaskSerdeTest
             ImmutableMap.<String, Object>of(),
             ImmutableList.of("dim1", "dim2"),
             ImmutableList.of("metric1", "metric2"),
-            new NoneShardSpec(),
+            NoneShardSpec.instance(),
             0,
             12345L
         ),
@@ -511,13 +514,16 @@ public class TaskSerdeTest
         ImmutableMap.<String, Object>of(),
         ImmutableList.of("dim1", "dim2"),
         ImmutableList.of("metric1", "metric2"),
-        new NoneShardSpec(),
+        NoneShardSpec.instance(),
         0,
         12345L
     );
     final ConvertSegmentTask convertSegmentTaskOriginal = ConvertSegmentTask.create(
         segment,
-        new IndexSpec(new RoaringBitmapSerdeFactory(), "lzf", "uncompressed"),
+        new IndexSpec(new RoaringBitmapSerdeFactory(null),
+                      CompressedObjectStrategy.CompressionStrategy.LZF,
+                      CompressedObjectStrategy.CompressionStrategy.UNCOMPRESSED,
+                      CompressionFactory.LongEncodingStrategy.LONGS),
         false,
         true,
         null

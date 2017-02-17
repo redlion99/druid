@@ -62,6 +62,7 @@ import io.druid.segment.realtime.plumber.Plumber;
 import io.druid.timeline.DataSegment;
 import io.druid.timeline.partition.HashBasedNumberedShardSpec;
 import io.druid.timeline.partition.NoneShardSpec;
+import io.druid.timeline.partition.NumberedShardSpec;
 import io.druid.timeline.partition.ShardSpec;
 import org.joda.time.DateTime;
 import org.joda.time.Interval;
@@ -214,14 +215,26 @@ public class IndexTask extends AbstractFixedIntervalTask
             shardSpecs.add(new HashBasedNumberedShardSpec(i, numShards, null, jsonMapper));
           }
         } else {
-          shardSpecs = ImmutableList.<ShardSpec>of(new NoneShardSpec());
+          shardSpecs = ImmutableList.<ShardSpec>of(NoneShardSpec.instance());
         }
       }
       for (final ShardSpec shardSpec : shardSpecs) {
+        // ShardSpec to be published.
+        final ShardSpec shardSpecForPublishing;
+        if (ingestionSchema.getTuningConfig().isForceExtendableShardSpecs()) {
+          shardSpecForPublishing = new NumberedShardSpec(
+              shardSpec.getPartitionNum(),
+              shardSpecs.size()
+          );
+        } else {
+          shardSpecForPublishing = shardSpec;
+        }
+
         final DataSegment segment = generateSegment(
             toolbox,
             ingestionSchema.getDataSchema(),
             shardSpec,
+            shardSpecForPublishing,
             bucket,
             myLock.getVersion()
         );
@@ -301,7 +314,7 @@ public class IndexTask extends AbstractFixedIntervalTask
     final List<ShardSpec> shardSpecs = Lists.newArrayList();
 
     if (numberOfShards == 1) {
-      shardSpecs.add(new NoneShardSpec());
+      shardSpecs.add(NoneShardSpec.instance());
     } else {
       for (int i = 0; i < numberOfShards; ++i) {
         shardSpecs.add(new HashBasedNumberedShardSpec(i, numberOfShards, null, jsonMapper));
@@ -314,7 +327,8 @@ public class IndexTask extends AbstractFixedIntervalTask
   private DataSegment generateSegment(
       final TaskToolbox toolbox,
       final DataSchema schema,
-      final ShardSpec shardSpec,
+      final ShardSpec shardSpecForPartitioning,
+      final ShardSpec shardSpecForPublishing,
       final Interval interval,
       final String version
   ) throws IOException
@@ -328,7 +342,7 @@ public class IndexTask extends AbstractFixedIntervalTask
             interval.getStart(),
             interval.getEnd(),
             version,
-            shardSpec.getPartitionNum()
+            shardSpecForPartitioning.getPartitionNum()
         )
     );
 
@@ -339,10 +353,17 @@ public class IndexTask extends AbstractFixedIntervalTask
     final List<DataSegment> pushedSegments = new CopyOnWriteArrayList<DataSegment>();
     final DataSegmentPusher wrappedDataSegmentPusher = new DataSegmentPusher()
     {
+      @Deprecated
       @Override
       public String getPathForHadoop(String dataSource)
       {
-        return toolbox.getSegmentPusher().getPathForHadoop(dataSource);
+        return getPathForHadoop();
+      }
+
+      @Override
+      public String getPathForHadoop()
+      {
+        return toolbox.getSegmentPusher().getPathForHadoop();
       }
 
       @Override
@@ -374,7 +395,7 @@ public class IndexTask extends AbstractFixedIntervalTask
     ).findPlumber(
         schema,
         convertTuningConfig(
-            shardSpec,
+            shardSpecForPublishing,
             myRowFlushBoundary,
             ingestionSchema.getTuningConfig().getIndexSpec(),
             ingestionSchema.tuningConfig.getBuildV9Directly()
@@ -389,7 +410,7 @@ public class IndexTask extends AbstractFixedIntervalTask
       while (firehose.hasMore()) {
         final InputRow inputRow = firehose.nextRow();
 
-        if (shouldIndex(shardSpec, interval, inputRow, rollupGran)) {
+        if (shouldIndex(shardSpecForPartitioning, interval, inputRow, rollupGran)) {
           int numRows = plumber.add(inputRow, committerSupplier);
           if (numRows == -1) {
             throw new ISE(
@@ -420,7 +441,7 @@ public class IndexTask extends AbstractFixedIntervalTask
           + " and output %,d rows",
           getId(),
           interval,
-          shardSpec.getPartitionNum(),
+          shardSpecForPartitioning.getPartitionNum(),
           metrics.processed() + metrics.unparseable() + metrics.thrownAway(),
           metrics.processed(),
           metrics.unparseable(),
@@ -450,7 +471,7 @@ public class IndexTask extends AbstractFixedIntervalTask
 
       this.dataSchema = dataSchema;
       this.ioConfig = ioConfig;
-      this.tuningConfig = tuningConfig == null ? new IndexTuningConfig(0, 0, null, null, null) : tuningConfig;
+      this.tuningConfig = tuningConfig == null ? new IndexTuningConfig(0, 0, null, null, null, false) : tuningConfig;
     }
 
     @Override
@@ -508,6 +529,7 @@ public class IndexTask extends AbstractFixedIntervalTask
     private final int numShards;
     private final IndexSpec indexSpec;
     private final Boolean buildV9Directly;
+    private final boolean forceExtendableShardSpecs;
 
     @JsonCreator
     public IndexTuningConfig(
@@ -515,7 +537,8 @@ public class IndexTask extends AbstractFixedIntervalTask
         @JsonProperty("rowFlushBoundary") int rowFlushBoundary,
         @JsonProperty("numShards") @Nullable Integer numShards,
         @JsonProperty("indexSpec") @Nullable IndexSpec indexSpec,
-        @JsonProperty("buildV9Directly") Boolean buildV9Directly
+        @JsonProperty("buildV9Directly") Boolean buildV9Directly,
+        @JsonProperty("forceExtendableShardSpecs") boolean forceExtendableShardSpecs
     )
     {
       this.targetPartitionSize = targetPartitionSize == 0 ? DEFAULT_TARGET_PARTITION_SIZE : targetPartitionSize;
@@ -528,6 +551,7 @@ public class IndexTask extends AbstractFixedIntervalTask
           "targetPartitionsSize and shardCount both cannot be set"
       );
       this.buildV9Directly = buildV9Directly == null ? DEFAULT_BUILD_V9_DIRECTLY : buildV9Directly;
+      this.forceExtendableShardSpecs = forceExtendableShardSpecs;
     }
 
     @JsonProperty
@@ -558,6 +582,12 @@ public class IndexTask extends AbstractFixedIntervalTask
     public Boolean getBuildV9Directly()
     {
       return buildV9Directly;
+    }
+
+    @JsonProperty
+    public boolean isForceExtendableShardSpecs()
+    {
+      return forceExtendableShardSpecs;
     }
   }
 }

@@ -29,19 +29,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.type.TypeFactory;
 import com.google.common.base.Function;
 import com.google.common.base.Supplier;
-import com.google.common.base.Suppliers;
 import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.io.Closeables;
-import com.google.common.util.concurrent.ListenableFuture;
 import com.metamx.common.IAE;
 import com.metamx.common.guava.CloseQuietly;
 import com.metamx.common.guava.Sequence;
 import com.metamx.common.guava.Sequences;
 import com.metamx.common.guava.Yielder;
 import com.metamx.common.guava.YieldingAccumulator;
-
 import io.druid.collections.StupidPool;
 import io.druid.data.input.Row;
 import io.druid.data.input.impl.InputRowParser;
@@ -56,15 +53,18 @@ import io.druid.query.QueryRunner;
 import io.druid.query.QueryRunnerFactory;
 import io.druid.query.QueryRunnerTestHelper;
 import io.druid.query.QueryToolChest;
-import io.druid.query.QueryWatcher;
 import io.druid.query.groupby.GroupByQueryConfig;
-import io.druid.query.groupby.GroupByQueryEngine;
-import io.druid.query.groupby.GroupByQueryQueryToolChest;
 import io.druid.query.groupby.GroupByQueryRunnerFactory;
+import io.druid.query.groupby.GroupByQueryRunnerTest;
 import io.druid.query.select.SelectQueryEngine;
 import io.druid.query.select.SelectQueryQueryToolChest;
 import io.druid.query.select.SelectQueryRunnerFactory;
-import io.druid.segment.AbstractSegment;
+import io.druid.query.timeseries.TimeseriesQueryEngine;
+import io.druid.query.timeseries.TimeseriesQueryQueryToolChest;
+import io.druid.query.timeseries.TimeseriesQueryRunnerFactory;
+import io.druid.query.topn.TopNQueryConfig;
+import io.druid.query.topn.TopNQueryQueryToolChest;
+import io.druid.query.topn.TopNQueryRunnerFactory;
 import io.druid.segment.IndexIO;
 import io.druid.segment.IndexMerger;
 import io.druid.segment.IndexSpec;
@@ -74,7 +74,6 @@ import io.druid.segment.Segment;
 import io.druid.segment.column.ColumnConfig;
 import io.druid.segment.incremental.IncrementalIndex;
 import io.druid.segment.incremental.OnheapIncrementalIndex;
-
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.LineIterator;
 import org.junit.rules.TemporaryFolder;
@@ -133,38 +132,50 @@ public class AggregationTestHelper
   )
   {
     ObjectMapper mapper = new DefaultObjectMapper();
+    GroupByQueryRunnerFactory factory = GroupByQueryRunnerTest.makeQueryRunnerFactory(new GroupByQueryConfig());
 
-    Supplier<GroupByQueryConfig> configSupplier = Suppliers.ofInstance(new GroupByQueryConfig());
-    StupidPool<ByteBuffer> pool = new StupidPool<>(
-        new Supplier<ByteBuffer>()
+    IndexIO indexIO = new IndexIO(
+        mapper,
+        new ColumnConfig()
         {
           @Override
-          public ByteBuffer get()
+          public int columnCacheSizeBytes()
           {
-            return ByteBuffer.allocate(1024 * 1024);
+            return 0;
           }
-        });
-
-    QueryWatcher noopQueryWatcher = new QueryWatcher()
-    {
-      @Override
-      public void registerQuery(Query query, ListenableFuture future)
-      {
-
-      }
-    };
-
-    GroupByQueryEngine engine = new GroupByQueryEngine(configSupplier, pool);
-    GroupByQueryQueryToolChest toolchest = new GroupByQueryQueryToolChest(
-        configSupplier, mapper, engine, pool,
-        NoopIntervalChunkingQueryRunnerDecorator()
+        }
     );
-    GroupByQueryRunnerFactory factory = new GroupByQueryRunnerFactory(
-        engine,
-        noopQueryWatcher,
-        configSupplier,
-        toolchest,
-        pool
+
+    return new AggregationTestHelper(
+        mapper,
+        new IndexMerger(mapper, indexIO),
+        indexIO,
+        factory.getToolchest(),
+        factory,
+        tempFolder,
+        jsonModulesToRegister
+    );
+  }
+
+  public static final AggregationTestHelper createSelectQueryAggregationTestHelper(
+      List<? extends Module> jsonModulesToRegister,
+      TemporaryFolder tempFolder
+  )
+  {
+    ObjectMapper mapper = new DefaultObjectMapper();
+
+    SelectQueryQueryToolChest toolchest = new SelectQueryQueryToolChest(
+        new DefaultObjectMapper(),
+        QueryRunnerTestHelper.NoopIntervalChunkingQueryRunnerDecorator()
+    );
+
+    SelectQueryRunnerFactory factory = new SelectQueryRunnerFactory(
+        new SelectQueryQueryToolChest(
+            new DefaultObjectMapper(),
+            QueryRunnerTestHelper.NoopIntervalChunkingQueryRunnerDecorator()
+        ),
+        new SelectQueryEngine(),
+        QueryRunnerTestHelper.NOOP_QUERYWATCHER
     );
 
     IndexIO indexIO = new IndexIO(
@@ -190,24 +201,70 @@ public class AggregationTestHelper
     );
   }
 
-  public static final AggregationTestHelper createSelectQueryAggregationTestHelper(
+  public static final AggregationTestHelper createTimeseriesQueryAggregationTestHelper(
       List<? extends Module> jsonModulesToRegister,
       TemporaryFolder tempFolder
   )
   {
     ObjectMapper mapper = new DefaultObjectMapper();
 
-    SelectQueryQueryToolChest toolchest = new SelectQueryQueryToolChest(
-        new DefaultObjectMapper(),
+    TimeseriesQueryQueryToolChest toolchest = new TimeseriesQueryQueryToolChest(
         QueryRunnerTestHelper.NoopIntervalChunkingQueryRunnerDecorator()
     );
 
-    SelectQueryRunnerFactory factory = new SelectQueryRunnerFactory(
-        new SelectQueryQueryToolChest(
-            new DefaultObjectMapper(),
-            QueryRunnerTestHelper.NoopIntervalChunkingQueryRunnerDecorator()
+    TimeseriesQueryRunnerFactory factory = new TimeseriesQueryRunnerFactory(
+        toolchest,
+        new TimeseriesQueryEngine(),
+        QueryRunnerTestHelper.NOOP_QUERYWATCHER
+    );
+
+    IndexIO indexIO = new IndexIO(
+        mapper,
+        new ColumnConfig()
+        {
+          @Override
+          public int columnCacheSizeBytes()
+          {
+            return 0;
+          }
+        }
+    );
+
+    return new AggregationTestHelper(
+        mapper,
+        new IndexMerger(mapper, indexIO),
+        indexIO,
+        toolchest,
+        factory,
+        tempFolder,
+        jsonModulesToRegister
+    );
+  }
+
+  public static final AggregationTestHelper createTopNQueryAggregationTestHelper(
+      List<? extends Module> jsonModulesToRegister,
+      TemporaryFolder tempFolder
+  )
+  {
+    ObjectMapper mapper = new DefaultObjectMapper();
+
+    TopNQueryQueryToolChest toolchest = new TopNQueryQueryToolChest(
+        new TopNQueryConfig(),
+        QueryRunnerTestHelper.NoopIntervalChunkingQueryRunnerDecorator()
+    );
+
+    TopNQueryRunnerFactory factory = new TopNQueryRunnerFactory(
+        new StupidPool<>(
+            new Supplier<ByteBuffer>()
+            {
+              @Override
+              public ByteBuffer get()
+              {
+                return ByteBuffer.allocate(10*1024*1024);
+              }
+            }
         ),
-        new SelectQueryEngine(),
+        toolchest,
         QueryRunnerTestHelper.NOOP_QUERYWATCHER
     );
 
@@ -365,7 +422,7 @@ public class AggregationTestHelper
         for (File file : toMerge) {
           indexes.add(indexIO.loadIndex(file));
         }
-        indexMerger.mergeQueryableIndex(indexes, metrics, outDir, new IndexSpec());
+        indexMerger.mergeQueryableIndex(indexes, true, metrics, outDir, new IndexSpec());
 
         for (QueryableIndex qi : indexes) {
           qi.close();

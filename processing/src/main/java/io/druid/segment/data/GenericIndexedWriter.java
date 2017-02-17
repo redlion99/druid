@@ -22,6 +22,7 @@ package io.druid.segment.data;
 import com.google.common.base.Function;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
+import com.google.common.io.ByteSource;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.CountingOutputStream;
 import com.google.common.io.InputSupplier;
@@ -134,11 +135,13 @@ public class GenericIndexedWriter<T> implements Closeable
 
   public InputSupplier<InputStream> combineStreams()
   {
+    // ByteSource.concat is only available in guava 15 and higher
+    // This is guava 14 compatible
     return ByteStreams.join(
         Iterables.transform(
             Arrays.asList("meta", "header", "values"),
-            new Function<String,InputSupplier<InputStream>>() {
-
+            new Function<String, InputSupplier<InputStream>>()
+            {
               @Override
               public InputSupplier<InputStream> apply(final String input)
               {

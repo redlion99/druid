@@ -230,7 +230,8 @@ public class DeterminePartitionsJobTest
                             new DimensionsSpec(DimensionsSpec.getDefaultSchemas(ImmutableList.of("host", "country")), null, null),
                             null,
                             ImmutableList.of("timestamp", "host", "country", "visited_num")
-                        )
+                        ),
+                        null
                     ),
                     Map.class
                 ),
@@ -266,7 +267,8 @@ public class DeterminePartitionsJobTest
                 false,
                 null,
                 null,
-                null
+                null,
+                false
             )
         )
     );

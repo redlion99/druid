@@ -26,6 +26,7 @@ import com.google.common.io.ByteSource;
 import com.google.inject.Inject;
 import com.metamx.common.CompressionUtils;
 import com.metamx.common.logger.Logger;
+import io.druid.common.utils.UUIDUtils;
 import io.druid.segment.SegmentUtils;
 import io.druid.segment.loading.DataSegmentPusher;
 import io.druid.segment.loading.DataSegmentPusherUtil;
@@ -33,6 +34,7 @@ import io.druid.timeline.DataSegment;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.HadoopFsWrapper;
 import org.apache.hadoop.fs.Path;
 
 import java.io.File;
@@ -63,8 +65,15 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
     log.info("Configured HDFS as deep storage");
   }
 
+  @Deprecated
   @Override
   public String getPathForHadoop(String dataSource)
+  {
+    return getPathForHadoop();
+  }
+
+  @Override
+  public String getPathForHadoop()
   {
     return new Path(config.getStorageDirectory()).toUri().toString();
   }
@@ -81,24 +90,58 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
         storageDir
     );
 
-    Path outFile = new Path(String.format("%s/%s/index.zip", config.getStorageDirectory(), storageDir));
-    FileSystem fs = outFile.getFileSystem(hadoopConfig);
+    Path tmpFile = new Path(String.format(
+        "%s/%s/index.zip",
+        config.getStorageDirectory(),
+        UUIDUtils.generateUuid()
+    ));
+    FileSystem fs = tmpFile.getFileSystem(hadoopConfig);
 
-    fs.mkdirs(outFile.getParent());
-    log.info("Compressing files from[%s] to [%s]", inDir, outFile);
+    fs.mkdirs(tmpFile.getParent());
+    log.info("Compressing files from[%s] to [%s]", inDir, tmpFile);
 
     final long size;
-    try (FSDataOutputStream out = fs.create(outFile)) {
+    final DataSegment dataSegment;
+    try (FSDataOutputStream out = fs.create(tmpFile)) {
       size = CompressionUtils.zip(inDir, out);
+      final Path outFile = new Path(String.format("%s/%s/index.zip", config.getStorageDirectory(), storageDir));
+      final Path outDir = outFile.getParent();
+      dataSegment = createDescriptorFile(
+          segment.withLoadSpec(makeLoadSpec(outFile))
+                 .withSize(size)
+                 .withBinaryVersion(SegmentUtils.getVersionFromDir(inDir)),
+          tmpFile.getParent(),
+          fs
+      );
+
+      // Create parent if it does not exist, recreation is not an error
+      fs.mkdirs(outDir.getParent());
+      if (!HadoopFsWrapper.rename(fs, tmpFile.getParent(), outDir)) {
+        if (fs.exists(outDir)) {
+          log.info(
+              "Unable to rename temp directory[%s] to segment directory[%s]. It is already pushed by a replica task.",
+              tmpFile.getParent(),
+              outDir
+          );
+        } else {
+          throw new IOException(String.format(
+              "Failed to rename temp directory[%s] and segment directory[%s] is not present.",
+              tmpFile.getParent(),
+              outDir
+          ));
+        }
+      }
+    } finally {
+      try {
+        if (fs.exists(tmpFile.getParent()) && !fs.delete(tmpFile.getParent(), true)) {
+          log.error("Failed to delete temp directory[%s]", tmpFile.getParent());
+        }
+      } catch(IOException ex) {
+        log.error(ex, "Failed to delete temp directory[%s]", tmpFile.getParent());
+      }
     }
 
-    return createDescriptorFile(
-        segment.withLoadSpec(makeLoadSpec(outFile))
-               .withSize(size)
-               .withBinaryVersion(SegmentUtils.getVersionFromDir(inDir)),
-        outFile.getParent(),
-        fs
-    );
+    return dataSegment;
   }
 
   private DataSegment createDescriptorFile(DataSegment segment, Path outDir, final FileSystem fs) throws IOException
@@ -113,7 +156,7 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
 
   private ImmutableMap<String, Object> makeLoadSpec(Path outFile)
   {
-    return ImmutableMap.<String, Object>of("type", "hdfs", "path", outFile.toString());
+    return ImmutableMap.<String, Object>of("type", "hdfs", "path", outFile.toUri().toString());
   }
 
   private static class HdfsOutputStreamSupplier extends ByteSink

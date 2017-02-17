@@ -61,7 +61,7 @@ public class TimeBoundaryQueryQueryToolChest
   @Override
   public <T extends LogicalSegment> List<T> filterSegments(TimeBoundaryQuery query, List<T> segments)
   {
-    if (segments.size() <= 1) {
+    if (segments.size() <= 1 || query.hasFilters()) {
       return segments;
     }
 
@@ -109,7 +109,7 @@ public class TimeBoundaryQueryQueryToolChest
   @Override
   public ServiceMetricEvent.Builder makeMetricBuilder(TimeBoundaryQuery query)
   {
-    return new ServiceMetricEvent.Builder()
+    return DruidMetrics.makePartialQueryTimeMetric(query)
             .setDimension(DruidMetrics.DATASOURCE, DataSourceUtil.getMetricName(query.getDataSource()))
             .setDimension(DruidMetrics.TYPE, query.getType());
   }
@@ -129,7 +129,7 @@ public class TimeBoundaryQueryQueryToolChest
   }
 
   @Override
-  public CacheStrategy<Result<TimeBoundaryResultValue>, Object, TimeBoundaryQuery> getCacheStrategy(TimeBoundaryQuery query)
+  public CacheStrategy<Result<TimeBoundaryResultValue>, Object, TimeBoundaryQuery> getCacheStrategy(final TimeBoundaryQuery query)
   {
     return new CacheStrategy<Result<TimeBoundaryResultValue>, Object, TimeBoundaryQuery>()
     {

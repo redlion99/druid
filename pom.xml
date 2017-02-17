@@ -26,7 +26,7 @@
     </parent>
 
     <artifactId>druid</artifactId>
-    <version>0.9.1.2-SNAPSHOT</version>
+    <version>0.9.2.1-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <name>${project.groupId}:${project.artifactId}</name>
@@ -53,19 +53,22 @@
         <connection>scm:git:ssh://git@github.com/druid-io/druid.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/druid-io/druid.git</developerConnection>
         <url>https://github.com/druid-io/druid.git</url>
-        <tag>0.9.1-SNAPSHOT</tag>
+        <tag>0.9.2-SNAPSHOT</tag>
     </scm>
 
     <properties>
-        <metamx.java-util.version>0.27.9</metamx.java-util.version>
-        <apache.curator.version>2.10.0</apache.curator.version>
+        <metamx.java-util.version>0.27.10</metamx.java-util.version>
+        <apache.curator.version>2.11.0</apache.curator.version>
+        <guice.version>4.1.0</guice.version>
         <jetty.version>9.2.5.v20141112</jetty.version>
         <jersey.version>1.19</jersey.version>
         <!-- Watch out for Hadoop compatibility when updating to >= 2.5; see https://github.com/druid-io/druid/pull/1669 -->
         <jackson.version>2.4.6</jackson.version>
         <log4j.version>2.5</log4j.version>
         <slf4j.version>1.7.12</slf4j.version>
+        <!-- If compiling with different hadoop version also modify default hadoop coordinates in TaskConfig.java -->
         <hadoop.compile.version>2.3.0</hadoop.compile.version>
+        <hive.version>2.0.0</hive.version>
     </properties>
 
     <modules>
@@ -85,13 +88,14 @@
         <module>extensions-core/datasketches</module>
         <module>extensions-core/hdfs-storage</module>
         <module>extensions-core/histogram</module>
+        <module>extensions-core/stats</module>
         <module>extensions-core/kafka-eight</module>
         <module>extensions-core/kafka-extraction-namespace</module>
         <module>extensions-core/kafka-indexing-service</module>
         <module>extensions-core/mysql-metadata-storage</module>
         <module>extensions-core/postgresql-metadata-storage</module>
         <module>extensions-core/lookups-cached-global</module>
-        <module>extensions-core/namespace-lookup</module> <!-- ONLY FOR 0.9.1 TRANSITION -->
+        <module>extensions-core/lookups-cached-single</module>
         <module>extensions-core/s3-extensions</module>
         <!-- Community extensions -->
         <module>extensions-contrib/azure-extensions</module>
@@ -104,10 +108,8 @@
         <module>extensions-contrib/distinctcount</module>
         <module>extensions-contrib/parquet-extensions</module>
         <module>extensions-contrib/statsd-emitter</module>
+        <module>extensions-contrib/orc-extensions</module>
         <module>extensions-contrib/ali-oss-extensions</module>
-
-        <!-- distribution packaging -->
-        <module>distribution</module>
     </modules>
 
     <dependencyManagement>
@@ -137,7 +139,7 @@
             <dependency>
                 <groupId>com.metamx</groupId>
                 <artifactId>bytebuffer-collections</artifactId>
-                <version>0.2.4</version>
+                <version>0.2.5</version>
             </dependency>
             <dependency>
                 <groupId>com.metamx</groupId>
@@ -216,7 +218,7 @@
             <dependency>
                 <groupId>org.apache.zookeeper</groupId>
                 <artifactId>zookeeper</artifactId>
-                <version>3.4.8</version>
+                <version>3.4.9</version>
                 <exclusions>
                     <exclusion>
                         <groupId>org.slf4j</groupId>
@@ -262,17 +264,17 @@
             <dependency>
                 <groupId>com.google.inject</groupId>
                 <artifactId>guice</artifactId>
-                <version>4.0-beta</version>
+                <version>${guice.version}</version>
             </dependency>
             <dependency>
                 <groupId>com.google.inject.extensions</groupId>
                 <artifactId>guice-servlet</artifactId>
-                <version>4.0-beta</version>
+                <version>${guice.version}</version>
             </dependency>
             <dependency>
                 <groupId>com.google.inject.extensions</groupId>
                 <artifactId>guice-multibindings</artifactId>
-                <version>4.0-beta</version>
+                <version>${guice.version}</version>
             </dependency>
             <dependency>
                 <groupId>com.ibm.icu</groupId>
@@ -785,6 +787,9 @@
                     <configuration>
                         <!-- jdk8 started linting javadocs by default; ours are not fully compliant -->
                         <additionalparam>-Xdoclint:none</additionalparam>
+
+                        <!-- HadoopFsWrapper javadocs cannot be generated due to missing annotations -->
+                        <excludePackageNames>org.apache.hadoop.fs</excludePackageNames>
                     </configuration>
                 </plugin>
                 <plugin>
@@ -833,6 +838,27 @@
                     </plugins>
                 </pluginManagement>
             </build>
+        </profile>
+        <profile>
+            <id>java8</id>
+            <activation>
+                <jdk>1.8</jdk>
+            </activation>
+            <modules>
+                <module>extensions-core/caffeine-cache</module>
+                <!-- distribution packaging -->
+                <module>distribution</module>
+            </modules>
+        </profile>
+        <profile>
+            <id>java7</id>
+            <activation>
+                <jdk>1.7</jdk>
+            </activation>
+            <modules>
+                <!-- distribution packaging -->
+                <module>distribution</module>
+            </modules>
         </profile>
     </profiles>
 </project>

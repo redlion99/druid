@@ -20,6 +20,7 @@
 package io.druid.segment;
 
 import com.google.common.base.Function;
+import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
@@ -27,14 +28,22 @@ import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.metamx.common.guava.CloseQuietly;
+import com.google.common.io.Closer;
+import com.metamx.collections.bitmap.ImmutableBitmap;
 import com.metamx.common.guava.Sequence;
 import com.metamx.common.guava.Sequences;
 import io.druid.granularity.QueryGranularity;
 import io.druid.query.QueryInterruptedException;
+import io.druid.query.dimension.DefaultDimensionSpec;
 import io.druid.query.dimension.DimensionSpec;
 import io.druid.query.extraction.ExtractionFn;
+import io.druid.query.filter.BooleanFilter;
+import io.druid.query.filter.DruidLongPredicate;
+import io.druid.query.filter.DruidPredicateFactory;
 import io.druid.query.filter.Filter;
+import io.druid.query.filter.RowOffsetMatcherFactory;
+import io.druid.query.filter.ValueMatcher;
+import io.druid.query.filter.ValueMatcherFactory;
 import io.druid.segment.column.BitmapIndex;
 import io.druid.segment.column.Column;
 import io.druid.segment.column.ColumnCapabilities;
@@ -45,12 +54,18 @@ import io.druid.segment.column.ValueType;
 import io.druid.segment.data.Indexed;
 import io.druid.segment.data.IndexedInts;
 import io.druid.segment.data.Offset;
+import io.druid.segment.filter.AndFilter;
+import io.druid.segment.filter.BooleanValueMatcher;
+import io.druid.segment.filter.Filters;
 import org.joda.time.DateTime;
 import org.joda.time.Interval;
+import org.roaringbitmap.IntIterator;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -118,26 +133,16 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
   @Override
   public DateTime getMinTime()
   {
-    GenericColumn column = null;
-    try {
-      column = index.getColumn(Column.TIME_COLUMN_NAME).getGenericColumn();
+    try (final GenericColumn column = index.getColumn(Column.TIME_COLUMN_NAME).getGenericColumn()) {
       return new DateTime(column.getLongSingleValueRow(0));
-    }
-    finally {
-      CloseQuietly.close(column);
     }
   }
 
   @Override
   public DateTime getMaxTime()
   {
-    GenericColumn column = null;
-    try {
-      column = index.getColumn(Column.TIME_COLUMN_NAME).getGenericColumn();
+    try (final GenericColumn column = index.getColumn(Column.TIME_COLUMN_NAME).getGenericColumn()) {
       return new DateTime(column.getLongSingleValueRow(column.length() - 1));
-    }
-    finally {
-      CloseQuietly.close(column);
     }
   }
 
@@ -172,15 +177,22 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
   @Override
   public ColumnCapabilities getColumnCapabilities(String column)
   {
-    return index.getColumn(column).getCapabilities();
+    return getColumnCapabilites(index, column);
+  }
+
+  @Override
+  public Map<String, DimensionHandler> getDimensionHandlers()
+  {
+    return index.getDimensionHandlers();
   }
 
   @Override
   public String getColumnTypeName(String columnName)
   {
     final Column column = index.getColumn(columnName);
-    final ComplexColumn complexColumn = column.getComplexColumn();
-    return complexColumn != null ? complexColumn.getTypeName() : column.getCapabilities().getType().toString();
+    try (final ComplexColumn complexColumn = column.getComplexColumn()) {
+      return complexColumn != null ? complexColumn.getTypeName() : column.getCapabilities().getType().toString();
+    }
   }
 
   @Override
@@ -213,16 +225,73 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
       actualInterval = actualInterval.withEnd(dataInterval.getEnd());
     }
 
+    final ColumnSelectorBitmapIndexSelector selector = new ColumnSelectorBitmapIndexSelector(
+        index.getBitmapFactoryForDimensions(),
+        index
+    );
+
+
+    /**
+     * Filters can be applied in two stages:
+     * pre-filtering: Use bitmap indexes to prune the set of rows to be scanned.
+     * post-filtering: Iterate through rows and apply the filter to the row values
+     *
+     * The pre-filter and post-filter step have an implicit AND relationship. (i.e., final rows are those that
+     * were not pruned AND those that matched the filter during row scanning)
+     *
+     * An AND filter can have its subfilters partitioned across the two steps. The subfilters that can be
+     * processed entirely with bitmap indexes (subfilter returns true for supportsBitmapIndex())
+     * will be moved to the pre-filtering stage.
+     *
+     * Any subfilters that cannot be processed entirely with bitmap indexes will be moved to the post-filtering stage.
+     */
     final Offset offset;
+    final List<Filter> postFilters = new ArrayList<>();
     if (filter == null) {
       offset = new NoFilterOffset(0, index.getNumRows(), descending);
     } else {
-      final ColumnSelectorBitmapIndexSelector selector = new ColumnSelectorBitmapIndexSelector(
-          index.getBitmapFactoryForDimensions(),
-          index
-      );
+      final List<Filter> preFilters = new ArrayList<>();
 
-      offset = new BitmapOffset(selector.getBitmapFactory(), filter.getBitmapIndex(selector), descending);
+      if (filter instanceof AndFilter) {
+        // If we get an AndFilter, we can split the subfilters across both filtering stages
+        for (Filter subfilter : ((AndFilter) filter).getFilters()) {
+          if (subfilter.supportsBitmapIndex(selector)) {
+            preFilters.add(subfilter);
+          } else {
+            postFilters.add(subfilter);
+          }
+        }
+      } else {
+        // If we get an OrFilter or a single filter, handle the filter in one stage
+        if (filter.supportsBitmapIndex(selector)) {
+          preFilters.add(filter);
+        } else {
+          postFilters.add(filter);
+        }
+      }
+
+      if (preFilters.size() == 0) {
+        offset = new NoFilterOffset(0, index.getNumRows(), descending);
+      } else {
+        List<ImmutableBitmap> bitmaps = Lists.newArrayList();
+        for (Filter prefilter : preFilters) {
+          bitmaps.add(prefilter.getBitmapIndex(selector));
+        }
+        offset = new BitmapOffset(
+            selector.getBitmapFactory(),
+            selector.getBitmapFactory().intersection(bitmaps),
+            descending
+        );
+      }
+    }
+
+    final Filter postFilter;
+    if (postFilters.size() == 0) {
+      postFilter = null;
+    } else if (postFilters.size() == 1) {
+      postFilter = postFilters.get(0);
+    } else {
+      postFilter = new AndFilter(postFilters);
     }
 
     return Sequences.filter(
@@ -233,10 +302,32 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
             offset,
             minDataTimestamp,
             maxDataTimestamp,
-            descending
+            descending,
+            postFilter,
+            selector
         ).build(),
         Predicates.<Cursor>notNull()
     );
+  }
+
+  private static ColumnCapabilities getColumnCapabilites(ColumnSelector index, String columnName)
+  {
+    Column columnObj = index.getColumn(columnName);
+    if (columnObj == null) {
+      return null;
+    }
+    return columnObj.getCapabilities();
+  }
+
+  private interface CursorAdvancer
+  {
+    public void advance();
+
+    public void advanceTo(int offset);
+
+    public boolean isDone();
+
+    public void reset();
   }
 
   private static class CursorSequenceBuilder
@@ -248,6 +339,8 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
     private final long minDataTimestamp;
     private final long maxDataTimestamp;
     private final boolean descending;
+    private final Filter postFilter;
+    private final ColumnSelectorBitmapIndexSelector bitmapIndexSelector;
 
     public CursorSequenceBuilder(
         ColumnSelector index,
@@ -256,7 +349,9 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
         Offset offset,
         long minDataTimestamp,
         long maxDataTimestamp,
-        boolean descending
+        boolean descending,
+        Filter postFilter,
+        ColumnSelectorBitmapIndexSelector bitmapIndexSelector
     )
     {
       this.index = index;
@@ -266,6 +361,8 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
       this.minDataTimestamp = minDataTimestamp;
       this.maxDataTimestamp = maxDataTimestamp;
       this.descending = descending;
+      this.postFilter = postFilter;
+      this.bitmapIndexSelector = bitmapIndexSelector;
     }
 
     public Sequence<Cursor> build()
@@ -274,10 +371,12 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
 
       final Map<String, DictionaryEncodedColumn> dictionaryColumnCache = Maps.newHashMap();
       final Map<String, GenericColumn> genericColumnCache = Maps.newHashMap();
-      final Map<String, ComplexColumn> complexColumnCache = Maps.newHashMap();
       final Map<String, Object> objectColumnCache = Maps.newHashMap();
 
       final GenericColumn timestamps = index.getColumn(Column.TIME_COLUMN_NAME).getGenericColumn();
+
+      final Closer closer = Closer.create();
+      closer.register(timestamps);
 
       Iterable<Long> iterable = gran.iterable(interval.getStartMillis(), interval.getEndMillis());
       if (descending) {
@@ -323,48 +422,14 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                                             maxDataTimestamp < timeEnd
                                         );
 
-                  return new Cursor()
+
+                  final Offset initOffset = offset.clone();
+                  final DateTime myBucket = gran.toDateTime(input);
+                  final CursorOffsetHolder cursorOffsetHolder = new CursorOffsetHolder();
+
+                  abstract class QueryableIndexBaseCursor implements Cursor
                   {
-                    private final Offset initOffset = offset.clone();
-                    private final DateTime myBucket = gran.toDateTime(input);
-                    private Offset cursorOffset = offset;
-
-                    @Override
-                    public DateTime getTime()
-                    {
-                      return myBucket;
-                    }
-
-                    @Override
-                    public void advance()
-                    {
-                      if (Thread.interrupted()) {
-                        throw new QueryInterruptedException(new InterruptedException());
-                      }
-                      cursorOffset.increment();
-                    }
-
-                    @Override
-                    public void advanceTo(int offset)
-                    {
-                      int count = 0;
-                      while (count < offset && !isDone()) {
-                        advance();
-                        count++;
-                      }
-                    }
-
-                    @Override
-                    public boolean isDone()
-                    {
-                      return !cursorOffset.withinBounds();
-                    }
-
-                    @Override
-                    public void reset()
-                    {
-                      cursorOffset = initOffset.clone();
-                    }
+                    Offset cursorOffset;
 
                     @Override
                     public DimensionSelector makeDimensionSelector(
@@ -394,13 +459,14 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                         );
                       }
 
-                      DictionaryEncodedColumn cachedColumn = dictionaryColumnCache.get(dimension);
+                      DictionaryEncodedColumn<String> cachedColumn = dictionaryColumnCache.get(dimension);
                       if (cachedColumn == null) {
                         cachedColumn = columnDesc.getDictionaryEncoding();
+                        closer.register(cachedColumn);
                         dictionaryColumnCache.put(dimension, cachedColumn);
                       }
 
-                      final DictionaryEncodedColumn column = cachedColumn;
+                      final DictionaryEncodedColumn<String> column = cachedColumn;
 
                       if (column == null) {
                         return NULL_DIMENSION_SELECTOR;
@@ -507,6 +573,7 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                       }
                     }
 
+
                     @Override
                     public FloatColumnSelector makeFloatColumnSelector(String columnName)
                     {
@@ -517,6 +584,7 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                         if (holder != null && (holder.getCapabilities().getType() == ValueType.FLOAT
                                                || holder.getCapabilities().getType() == ValueType.LONG)) {
                           cachedMetricVals = holder.getGenericColumn();
+                          closer.register(cachedMetricVals);
                           genericColumnCache.put(columnName, cachedMetricVals);
                         }
                       }
@@ -553,6 +621,7 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                         if (holder != null && (holder.getCapabilities().getType() == ValueType.LONG
                                                || holder.getCapabilities().getType() == ValueType.FLOAT)) {
                           cachedMetricVals = holder.getGenericColumn();
+                          closer.register(cachedMetricVals);
                           genericColumnCache.put(columnName, cachedMetricVals);
                         }
                       }
@@ -579,6 +648,7 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                       };
                     }
 
+
                     @Override
                     public ObjectColumnSelector makeObjectColumnSelector(String column)
                     {
@@ -600,6 +670,7 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                         }
 
                         if (cachedColumnVals != null) {
+                          closer.register((Closeable) cachedColumnVals);
                           objectColumnCache.put(column, cachedColumnVals);
                         }
                       }
@@ -669,7 +740,7 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                       }
 
                       if (cachedColumnVals instanceof DictionaryEncodedColumn) {
-                        final DictionaryEncodedColumn columnVals = (DictionaryEncodedColumn) cachedColumnVals;
+                        final DictionaryEncodedColumn<String> columnVals = (DictionaryEncodedColumn) cachedColumnVals;
                         if (columnVals.hasMultipleValues()) {
                           return new ObjectColumnSelector<Object>()
                           {
@@ -730,35 +801,351 @@ public class QueryableIndexStorageAdapter implements StorageAdapter
                         }
                       };
                     }
-                  };
+
+                    @Override
+                    public ColumnCapabilities getColumnCapabilities(String columnName)
+                    {
+                      return getColumnCapabilites(index, columnName);
+                    }
+                  }
+
+                  if (postFilter == null) {
+                    return new QueryableIndexBaseCursor()
+                    {
+                      {
+                        reset();
+                      }
+
+                      @Override
+                      public DateTime getTime()
+                      {
+                        return myBucket;
+                      }
+
+                      @Override
+                      public void advance()
+                      {
+                        if (Thread.interrupted()) {
+                          throw new QueryInterruptedException(new InterruptedException());
+                        }
+                        cursorOffset.increment();
+                      }
+
+                      @Override
+                      public void advanceTo(int offset)
+                      {
+                        int count = 0;
+                        while (count < offset && !isDone()) {
+                          advance();
+                          count++;
+                        }
+                      }
+
+                      @Override
+                      public boolean isDone()
+                      {
+                        return !cursorOffset.withinBounds();
+                      }
+
+                      @Override
+                      public void reset()
+                      {
+                        cursorOffset = initOffset.clone();
+                        cursorOffsetHolder.set(cursorOffset);
+                      }
+                    };
+                  } else {
+                    return new QueryableIndexBaseCursor()
+                    {
+                      CursorOffsetHolderValueMatcherFactory valueMatcherFactory = new CursorOffsetHolderValueMatcherFactory(
+                          index,
+                          this
+                      );
+                      RowOffsetMatcherFactory rowOffsetMatcherFactory = new CursorOffsetHolderRowOffsetMatcherFactory(
+                          cursorOffsetHolder,
+                          descending
+                      );
+
+                      final ValueMatcher filterMatcher;
+                      {
+                        if (postFilter instanceof BooleanFilter) {
+                          filterMatcher = ((BooleanFilter) postFilter).makeMatcher(
+                              bitmapIndexSelector,
+                              valueMatcherFactory,
+                              rowOffsetMatcherFactory
+                          );
+                        } else {
+                          if (postFilter.supportsBitmapIndex(bitmapIndexSelector)) {
+                            filterMatcher = rowOffsetMatcherFactory.makeRowOffsetMatcher(postFilter.getBitmapIndex(
+                                bitmapIndexSelector));
+                          } else {
+                            filterMatcher = postFilter.makeMatcher(valueMatcherFactory);
+                          }
+                        }
+                      }
+
+                      {
+                        reset();
+                      }
+
+                      @Override
+                      public DateTime getTime()
+                      {
+                        return myBucket;
+                      }
+
+                      @Override
+                      public void advance()
+                      {
+                        if (Thread.interrupted()) {
+                          throw new QueryInterruptedException(new InterruptedException());
+                        }
+                        cursorOffset.increment();
+
+                        while (!isDone()) {
+                          if (Thread.interrupted()) {
+                            throw new QueryInterruptedException(new InterruptedException());
+                          }
+                          if (filterMatcher.matches()) {
+                            return;
+                          } else {
+                            cursorOffset.increment();
+                          }
+                        }
+                      }
+
+                      @Override
+                      public void advanceTo(int offset)
+                      {
+                        int count = 0;
+                        while (count < offset && !isDone()) {
+                          advance();
+                          count++;
+                        }
+                      }
+
+                      @Override
+                      public boolean isDone()
+                      {
+                        return !cursorOffset.withinBounds();
+                      }
+
+                      @Override
+                      public void reset()
+                      {
+                        cursorOffset = initOffset.clone();
+                        cursorOffsetHolder.set(cursorOffset);
+                        if (!isDone()) {
+                          if (filterMatcher.matches()) {
+                            return;
+                          } else {
+                            advance();
+                          }
+                        }
+                      }
+                    };
+                  }
                 }
               }
           ),
-          new Closeable()
-          {
-            @Override
-            public void close() throws IOException
-            {
-              CloseQuietly.close(timestamps);
-              for (DictionaryEncodedColumn column : dictionaryColumnCache.values()) {
-                CloseQuietly.close(column);
-              }
-              for (GenericColumn column : genericColumnCache.values()) {
-                CloseQuietly.close(column);
-              }
-              for (ComplexColumn complexColumn : complexColumnCache.values()) {
-                CloseQuietly.close(complexColumn);
-              }
-              for (Object column : objectColumnCache.values()) {
-                if (column instanceof Closeable) {
-                  CloseQuietly.close((Closeable) column);
-                }
-              }
-            }
-          }
+          closer
       );
     }
   }
+
+  public static class CursorOffsetHolder
+  {
+    Offset currOffset = null;
+
+    public Offset get()
+    {
+      return currOffset;
+    }
+
+    public void set(Offset currOffset)
+    {
+      this.currOffset = currOffset;
+    }
+  }
+
+  private static boolean isComparableNullOrEmpty(final Comparable value)
+  {
+    if (value instanceof String) {
+      return Strings.isNullOrEmpty((String) value);
+    }
+    return value == null;
+  }
+
+  private static class CursorOffsetHolderValueMatcherFactory implements ValueMatcherFactory
+  {
+    private final ColumnSelector index;
+    private final ColumnSelectorFactory cursor;
+
+    public CursorOffsetHolderValueMatcherFactory(
+        ColumnSelector index,
+        ColumnSelectorFactory cursor
+    )
+    {
+      this.index = index;
+      this.cursor = cursor;
+    }
+
+    @Override
+    public ValueMatcher makeValueMatcher(String dimension, final Comparable value)
+    {
+      if (getTypeForDimension(dimension) == ValueType.LONG) {
+        return Filters.getLongValueMatcher(
+            cursor.makeLongColumnSelector(dimension),
+            value
+        );
+      }
+
+      final DimensionSelector selector = cursor.makeDimensionSelector(
+          new DefaultDimensionSpec(dimension, dimension)
+      );
+
+      // if matching against null, rows with size 0 should also match
+      final boolean matchNull = isComparableNullOrEmpty(value);
+
+      final int id = selector.lookupId((String) value);
+      if (id < 0) {
+        return new BooleanValueMatcher(false);
+      } else {
+        return new ValueMatcher()
+        {
+          @Override
+          public boolean matches()
+          {
+            IndexedInts row = selector.getRow();
+            if (row.size() == 0) {
+              return matchNull;
+            }
+            for (int i = 0; i < row.size(); i++) {
+              if (row.get(i) == id) {
+                return true;
+              }
+            }
+            return false;
+          }
+        };
+      }
+    }
+
+    @Override
+    public ValueMatcher makeValueMatcher(String dimension, final DruidPredicateFactory predicateFactory)
+    {
+      ValueType type = getTypeForDimension(dimension);
+      switch (type) {
+        case LONG:
+          return makeLongValueMatcher(dimension, predicateFactory.makeLongPredicate());
+        case STRING:
+          return makeStringValueMatcher(dimension, predicateFactory.makeStringPredicate());
+        default:
+          return new BooleanValueMatcher(predicateFactory.makeStringPredicate().apply(null));
+      }
+    }
+
+    private ValueMatcher makeStringValueMatcher(String dimension, final Predicate<String> predicate)
+    {
+      final DimensionSelector selector = cursor.makeDimensionSelector(
+          new DefaultDimensionSpec(dimension, dimension)
+      );
+
+      return new ValueMatcher()
+      {
+        final boolean matchNull = predicate.apply(null);
+
+        @Override
+        public boolean matches()
+        {
+          IndexedInts row = selector.getRow();
+          if (row.size() == 0) {
+            return matchNull;
+          }
+          for (int i = 0; i < row.size(); i++) {
+            if (predicate.apply(selector.lookupName(row.get(i)))) {
+              return true;
+            }
+          }
+          return false;
+        }
+      };
+    }
+
+    private ValueMatcher makeLongValueMatcher(String dimension, final DruidLongPredicate predicate)
+    {
+      return Filters.getLongPredicateMatcher(
+          cursor.makeLongColumnSelector(dimension),
+          predicate
+      );
+    }
+
+    private ValueType getTypeForDimension(String dimension)
+    {
+      ColumnCapabilities capabilities = getColumnCapabilites(index, dimension);
+      return capabilities == null ? ValueType.STRING : capabilities.getType();
+    }
+  }
+
+  private static class CursorOffsetHolderRowOffsetMatcherFactory implements RowOffsetMatcherFactory
+  {
+    private final CursorOffsetHolder holder;
+    private final boolean descending;
+
+    public CursorOffsetHolderRowOffsetMatcherFactory(CursorOffsetHolder holder, boolean descending)
+    {
+      this.holder = holder;
+      this.descending = descending;
+    }
+
+    // Use an iterator-based implementation, ImmutableBitmap.get(index) works differently for Concise and Roaring.
+    // ImmutableConciseSet.get(index) is also inefficient, it performs a linear scan on each call
+    @Override
+    public ValueMatcher makeRowOffsetMatcher(final ImmutableBitmap rowBitmap) {
+      final IntIterator iter = descending ?
+                               BitmapOffset.getReverseBitmapOffsetIterator(rowBitmap) :
+                               rowBitmap.iterator();
+
+      if(!iter.hasNext()) {
+        return new BooleanValueMatcher(false);
+      }
+
+      if (descending) {
+        return new ValueMatcher()
+        {
+          int iterOffset = Integer.MAX_VALUE;
+
+          @Override
+          public boolean matches()
+          {
+            int currentOffset = holder.get().getOffset();
+            while (iterOffset > currentOffset && iter.hasNext()) {
+              iterOffset = iter.next();
+            }
+
+            return iterOffset == currentOffset;
+          }
+        };
+      } else {
+        return new ValueMatcher()
+        {
+          int iterOffset = -1;
+
+          @Override
+          public boolean matches()
+          {
+            int currentOffset = holder.get().getOffset();
+            while (iterOffset < currentOffset && iter.hasNext()) {
+              iterOffset = iter.next();
+            }
+
+            return iterOffset == currentOffset;
+          }
+        };
+      }
+    }
+  }
+
 
   private abstract static class TimestampCheckingOffset implements Offset
   {
